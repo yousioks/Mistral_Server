@@ -1,261 +1,63 @@
-# MISTRAL (Remon Defense Agent)
+# MISTRAL Defense — Server
 
-**MISTRAL** — это многоуровневая система активной защиты серверной инфраструктуры застройщика **Remon Development**. Агент обнаруживает аномалии, предотвращает DDoS-атаки, эксплуатацию CVE и внутренние уязвимости кода.
-
----
-
-## 📋 Содержание
-
-- [Архитектура](#архитектура)
-- [Уровни компонентов](#уровни-компонентов)
-- [Быстрый старт](#быстрый-старт)
-- [Конфигурация](#конфигурация)
-- [Безопасность](#безопасность)
-- [Развёртывание](#развёртывание)
-- [Тестирование](#тестирование)
-
----
-
-## Архитектура
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Уровень 3: Нейронный агент                │
-│  OpenRouter API (GPT-5.1 Codex / GPT-5.2 / Qwen 3)          │
-│  Активируется при аномалии или через рубильник              │
-└─────────────────────────────────────────────────────────────┘
-                              ▲
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│         Уровень 2.5: Сканеры безопасности (спящие)          │
-│  Semgrep (SAST), Trivy (CVE/образы)                         │
-└─────────────────────────────────────────────────────────────┘
-                              ▲
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│              Уровень 2: Асинхронные мониторы                 │
-│  Системный, сетевой, процессный мониторинг                   │
-└─────────────────────────────────────────────────────────────┘
-                              ▲
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│              Уровень 1: Серверная инфраструктура             │
-│  Ubuntu/Debian, nginx, Docker, PostgreSQL                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Уровни компонентов
-
-### Уровень 2: Асинхронные мониторы (постоянная работа)
-
-| Скрипт | Язык | Обязанности |
-|--------|------|-------------|
-| **Скрипт A** | Python | Системные метрики, systemd, Docker daemon |
-| **Скрипт B** | Python/Lua | Root-сессии, auth.log, SSH-ключи |
-| **Скрипт C** | Python/C++ | Сетевые соединения, процессы, порты |
-| **Скрипт D** | Python | Целостность файлов, CVE-проверка |
-| **Скрипт E** | Python | Semgrep + Trivy сканеры |
-
-### Уровень 2.5: Сканеры безопасности (активируются по требованию)
-
-- **Semgrep** — статический анализ кода (SAST)
-- **Trivy** — сканирование Docker-образов и OS-пакетов на CVE
-
-### Уровень 3: Нейронный агент (активируется при аномалии)
-
-- **OpenRouter API** с поддержкой трёх моделей:
-  - `openai/gpt-5.1-codex` — дефолт, аудит кода
-  - `openai/gpt-5.2-codex` — стратегический анализ
-  - `qwen/qwen-3-coder-next` — быстрые правила (iptables/nginx)
-
----
+Универсальный сервер агента безопасности для Ubuntu/Debian. Включает REST API, WebSocket Secure (WSS), Telegram-бота, Lua-мониторы, сканеры (Semgrep/Trivy), SQLite-хранилище и интеграцию с нейросетями через aitunnel.ru.
 
 ## Быстрый старт
 
-### 1. Клонирование репозитория
-
-```powershell
-git clone https://github.com/yousioks/Mistral.git
-cd Mistral
+```bash
+cp .env.example .env
+# Отредактируй .env — укажи AITUNNEL_API_KEY и TELEGRAM_BOT_TOKEN
+npm install
+chmod +x start.sh monitors/run-monitors.sh
+./start.sh
 ```
 
-### 2. Создание конфигурации
+## Архитектура
 
-```powershell
-# Скопируйте env.example в .env
-Copy-Item .env.example .env
+- **server.js** — REST API + WSS сервер
+- **telegram-bot.js** — Telegram бот оператора (standalone, общается через REST API)
+- **db.js** — SQLite с WAL, таблицы: incidents, logs, cve_logs, bot_logs
+- **scanners.js** — обёртки для Semgrep и Trivy
+- **monitors/lua/** — лёгковесные Lua-скрипты мониторинга
 
-# Отредактируйте .env с реальными данными
-notepad .env
-```
+## Lua-мониторы
 
-### 3. Установка зависимостей
+- `monitor_system.lua` — CPU, RAM, диск, темп, Docker, systemd, nginx
+- `monitor_auth.lua` — SSH-сессии, sudo, failed logins, authorized_keys
+- `monitor_network.lua` — порты, процессы, DDoS-индикаторы
+- `monitor_integrity.lua` — целостность файлов, Docker-образы, git-изменения
 
-```powershell
-# Установка Python-зависимостей
-pip install -r requirements.txt
-```
-
-### 4. Запуск мониторов
-
-```powershell
-# Запуск всех мониторов
-python src/monitors/monitor_runner.py
-```
-
----
-
-## Конфигурация
-
-### Переменные окружения (.env)
-
-| Параметр | Описание | Пример |
-|----------|----------|--------|
-| `OPENROUTER_API_KEY` | Ключ OpenRouter API | `sk-or-v1-...` |
-| `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота | `123456:ABC-DEF...` |
-| `SECURITY_ADMIN_ID` | ID администратора | `987654321` |
-| `DEFAULT_MODEL` | Модель по умолчанию | `openai/gpt-5.1-codex` |
-| `CPU_THRESHOLD_PERCENT` | Порог CPU для аномалии | `80` |
-| `RAM_THRESHOLD_PERCENT` | Порог RAM для аномалии | `85` |
-
-### Структура конфигурационных файлов
-
-```
-config/
-├── mistral.yaml          # Основная конфигурация агента
-├── models.yaml           # Настройки нейронных моделей
-└── thresholds.yaml       # Пороги мониторинга
-```
-
----
-
-## Безопасность
-
-### Защита от утечки данных
-
-- **`.env`** файл **НЕ** коммитится в git (добавлен в `.gitignore`)
-- API-ключи и токены хранятся только локально
-- Конфигурация с реальными данными хранится в `/etc/mistral/` на сервере
-
-### Правила безопасности агента
-
-1. **Агент не может отключать сайт** — запрет на остановку nginx, Docker, systemd-служб
-2. **Логи агента защищены** — append-only режим через `chattr +a`
-3. **Двойное подтверждение** — критичные действия требуют одобрения второго ИБ-специалиста
-4. **Аудит всех действий** — каждое действие нейросети логируется
-
-### Защита от атак на сам агент
-
-- Проверка целостности файлов агента
-- Мониторинг попыток модификации конфигурации
-- Блокировка подозрительных процессов
-
----
-
-## Развёртывание
-
-### На Ubuntu/Debian сервере
+## Docker
 
 ```bash
-# Клонирование
-sudo mkdir -p /opt/mistral
-cd /opt/mistral
-sudo git clone https://github.com/yousioks/Mistral.git .
-
-# Установка зависимостей
-sudo ./scripts/install/install.sh
-
-# Конфигурация
-sudo cp config/mistral.yaml.example /etc/mistral/mistral.yaml
-sudo nano /etc/mistral/mistral.yaml
-
-# Запуск мониторов
-sudo systemctl enable mistral-monitor
-sudo systemctl start mistral-monitor
-
-# Проверка статуса
-sudo systemctl status mistral-monitor
-sudo tail -f /var/log/mistral/monitor.log
+docker-compose up -d
 ```
 
-### Структура на сервере
+## Переменные окружения
+
+См. `.env.example` — все ключи, токены, пороги, пути.
+
+## Структура
 
 ```
-/opt/mistral/           # Код агента
-/etc/mistral/           # Конфигурация (права 600)
-/var/log/mistral/       # Логи
-  ├── monitor.log       # Логи мониторов
-  ├── agent.log         # Логи нейросети
-  ├── incidents/        # JSON-отчёты по инцидентам
-  ├── scanner/          # Логи Semgrep/Trivy
-  └── neural/           # Запросы/ответы OpenRouter
+.
+├── server.js
+├── telegram-bot.js
+├── db.js
+├── scanners.js
+├── start.sh
+├── docker-compose.yml
+├── .env.example
+├── monitors/
+│   ├── run-monitors.sh
+│   └── lua/
+│       ├── monitor_system.lua
+│       ├── monitor_auth.lua
+│       ├── monitor_network.lua
+│       ├── monitor_integrity.lua
+│       └── lib/http.lua
+└── writeups/
+    ├── sql_injection.json
+    ├── ddos_attack.json
+    └── red_team_v1.json
 ```
-
----
-
-## Тестирование
-
-### Red Team Write-up
-
-В проекте есть специальный write-up для симуляции атаки:
-
-```
-data/writeups/
-└── red_team_demo.md    # Сценарий атаки инсайдера
-```
-
-### Запуск тестов
-
-```powershell
-# Запуск unit-тестов
-pytest tests/
-
-# Запуск интеграционных тестов
-python tests/integration/test_monitoring.py
-```
-
----
-
-## Управление через Telegram-бот
-
-### Команды для ИБ-специалиста
-
-| Команда | Описание |
-|---------|----------|
-| `/status` | Статус агента и мониторов |
-| `/model codex` | Переключиться на Codex-модель |
-| `/model strategic` | Переключиться на стратегическую модель |
-| `/scan semgrep ./backend` | Запустить Semgrep на директории |
-| `/scan trivy image nginx` | Проверить Docker-образ на CVE |
-| `/fix last_scan` | Применить патчи по последнему скану |
-| `/mitigate last_scan` | Написать правила nginx/iptables |
-
----
-
-## Требования к окружению
-
-### Сервер
-
-- **OS:** Ubuntu 22.04+ / Debian 12+
-- **Python:** 3.11+
-- **Docker:** 24+
-- **nginx:** 1.24+
-
-### Локальная разработка
-
-- **Python:** 3.11+
-- **PowerShell:** 7.0+ (для скриптов установки)
-
----
-
-## Лицензия
-
-© 2024 Remon Development. Все права защищены.
-
----
-
-## Контакты
-
-Для вопросов по интеграции и настройке обращайтесь к команде информационной безопасности.

@@ -1,0 +1,34 @@
+﻿{
+  "title": "DDoS Write-up - Атака на nginx",
+  "description": "Симуляция DDoS-атаки для проверки защиты MISTRAL",
+  "author": "Red Team",
+  "date": "2024-01-16",
+  "target": "Remon Development Server",
+  "scenario": {
+    "step_1": {
+      "name": "SYN-flood атака",
+      "description": "Массированная отправка SYN-пакетов на порт 80/443",
+      "mitigation": "Monitor C обнаруживает рост соединений и SYN-пакетов"
+    },
+    "step_2": {
+      "name": "HTTP flood",
+      "description": "Множество HTTP-запросов с разных IP",
+      "mitigation": "Monitor C отслеживает количество соединений с одного IP"
+    },
+    "step_3": {
+      "name": "Slowloris",
+      "description": "Открытие множества соединений и удержание их",
+      "mitigation": "Monitor C обнаруживает аномальное количество ESTABLISHED соединений"
+    }
+  },
+  "expected_detection": [
+    "Рост ESTABLISHED соединений > 1000",
+    "Более 100 соединений с одного IP",
+    "Резкий рост соединений за 60 секунд"
+  ],
+  "countermeasures": [
+    "Автоматическое создание rate-limit правил в nginx",
+    "Добавление атакующих IP в iptables blacklist",
+    "Уведомление ИБ-специалиста"
+  ]
+}
