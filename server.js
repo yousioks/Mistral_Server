@@ -257,6 +257,8 @@ app.post('/api/auth/login', (req, res) => {
   }
 });
 
+app.post('/api/ai/model', (req, res) => {
+  const { model } = req.body;
   if (!MODELS[model] && !Object.values(MODELS).some(m => m.id === model)) {
     return res.status(400).json({ error: 'Unknown model' });
   }
