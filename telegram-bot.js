@@ -43,7 +43,8 @@ const api = {
   getLogs: (type, limit) => apiRequest('GET', `/api/logs?type=${type}&limit=${limit || 100}`).catch(() => ({ data: [] })),
   getIncidents: (limit) => apiRequest('GET', `/api/incidents?limit=${limit || 100}`).catch(() => ({ data: [] })),
   askAI: (model, task, systemPrompt) => apiRequest('POST', '/api/ai/task', { model, task, systemPrompt, caller: 'bot' }).catch(() => ({ error: 'AI unavailable' })),
-  switchModel: (model) => apiRequest('POST', '/api/ai/model', { model }).catch(() => ({})),
+  runSemgrep: (targetDir, rules) => apiRequest('POST', '/api/scan/semgrep', { targetDir, rules }).catch(() => ({ error: 'Semgrep failed', findings: [] })),
+  runTrivy: (target, scanType) => apiRequest('POST', '/api/scan/trivy', { target, scanType }).catch(() => ({ error: 'Trivy failed', findings: [] })),
 };
 
 // In-memory sessions only
@@ -103,12 +104,12 @@ const mainMenuKeyboard = {
   reply_markup: {
     keyboard: [
       [{ text: '📝 ЛОГИ' }, { text: '🛡️ CVE' }],
-      [{ text: '🧠 Включение проверки нейросетью' }],
+      [{ text: '🔎 Semgrep' }, { text: '🔍 Trivy' }],
+      [{ text: '🧠 Нейросеть' }],
     ],
     resize_keyboard: true,
   },
 };
-
 const logsSubMenu = {
   reply_markup: {
     keyboard: [
@@ -208,8 +209,14 @@ bot.on('message', async (msg) => {
   const text = msg.text || '';
   const pendingState = pending.get(chatId);
 
-  // Auth flow
-  if (pendingState && pendingState.step === 'await_login') {
+  // Universal back button — must be FIRST to intercept from any pending state
+  if (text === '🔙 Вернуться в главное меню') {
+    pending.delete(chatId);
+    await showMainMenu(chatId, OPERATOR_NICKNAME);
+    return;
+  }
+
+  // Auth flow  if (pendingState && pendingState.step === 'await_login') {
     pending.set(chatId, { step: 'await_password', login: text.trim() });
     await reply(chatId, 'Введите пароль:', { reply_markup: { remove_keyboard: true } });
     return;
@@ -374,11 +381,44 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (text === '🧠 Включение проверки нейросетью') {
-    await reply(chatId, '⚠️ <b>Внимание!</b>\nЛюбой запуск нейросети должен быть обоснован. Нажимая «продолжить», вы берёте на себя ответственность.', aiWarningMenu);
+  if (text === '🔎 Semgrep') {
+    await reply(chatId, '⏳ Запускаю Semgrep SAST...', backMenu);
+    try {
+      const result = await api.runSemgrep('/var/www/Mistral_Server', 'p/security-audit');
+      if (result.error) throw new Error(result.error);
+      const findings = result.findings || [];
+      const preview = findings.slice(0, 20).map(f => `• <b>${f.check_id || 'rule'}</b>: ${f.message || '—'} (${f.severity || 'info'})`).join('\n') || 'Уязвимостей не найдено.';
+      await reply(chatId, `🔎 <b>Semgrep результат:</b> (${findings.length} находок)\n\n${preview}`, mainMenuKeyboard);
+      api.addLog('bot', 'info', 'Semgrep scan completed', { chatId, findings: findings.length });
+      sendToClient({ type: 'semgrep_scan', chatId, findings: findings.length });
+    } catch (err) {
+      await reply(chatId, `❌ Ошибка Semgrep: ${err.message}`, mainMenuKeyboard);
+      api.addLog('bot', 'error', 'Semgrep scan failed', { chatId, error: err.message });
+    }
     return;
   }
 
+  if (text === '🔍 Trivy') {
+    await reply(chatId, '⏳ Запускаю Trivy CVE scan...', backMenu);
+    try {
+      const result = await api.runTrivy('/var/www/Mistral_Server', 'fs');
+      if (result.error) throw new Error(result.error);
+      const findings = result.findings || [];
+      const preview = findings.slice(0, 20).map(f => `• <b>${f.vulnerability_id || f.title || 'CVE'}</b>: ${f.title || '—'} (${f.severity || 'unknown'})`).join('\n') || 'CVE не найдены.';
+      await reply(chatId, `🔍 <b>Trivy результат:</b> (${findings.length} находок)\n\n${preview}`, mainMenuKeyboard);
+      api.addLog('bot', 'info', 'Trivy scan completed', { chatId, findings: findings.length });
+      sendToClient({ type: 'trivy_scan', chatId, findings: findings.length });
+    } catch (err) {
+      await reply(chatId, `❌ Ошибка Trivy: ${err.message}`, mainMenuKeyboard);
+      api.addLog('bot', 'error', 'Trivy scan failed', { chatId, error: err.message });
+    }
+    return;
+  }
+
+  if (text === '🧠 Нейросеть') {
+    await reply(chatId, '⚠️ <b>Внимание!</b>\nЛюбой запуск нейросети должен быть обоснован. Нажимая «продолжить», вы берёте на себя ответственность.', aiWarningMenu);
+    return;
+  }
   if (text === '⚠️ Я понимаю, продолжить') {
     await reply(chatId, 'Выберите модель:', aiModelMenu);
     return;
@@ -469,12 +509,5 @@ bot.on('message', async (msg) => {
     await reply(chatId, 'Выберите модель:', aiModelMenu);
     return;
   }
-
-  if (text === '🔙 Вернуться в главное меню') {
-    pending.delete(chatId);
-    await showMainMenu(chatId, OPERATOR_NICKNAME);
-    return;
-  }
 });
-
 console.log('[Telegram Bot] MISTRAL Defense Bot started. Polling...');
