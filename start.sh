@@ -152,12 +152,20 @@ log_info "═══════════════════════�
 echo ""
 API_PORT=$(grep '^API_PORT=' .env | cut -d= -f2 || echo 8080)
 WSS_PORT=$(grep '^WSS_PORT=' .env | cut -d= -f2 || echo 8443)
+  # Determine public IP for client connection string
+SERVER_IP=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+
 echo -e "  ${BLUE}Server REST API:${NC}    http://localhost:${API_PORT}"
 echo -e "  ${BLUE}Server WebSocket:${NC}   wss://localhost:${WSS_PORT}/ws"
 echo -e "  ${BLUE}Telegram Bot:${NC}       Polling mode"
 echo -e "  ${BLUE}Monitors:${NC}           Lua watchers active"
 echo -e "  ${BLUE}Logs:${NC}               $LOG_DIR/"
 echo -e "  ${BLUE}PID files:${NC}          $PID_DIR/"
+echo ""
+echo -e "  ┌─────────────────────────────────────────────┐"
+echo -e "  │  ${GREEN}CLIENT CONNECTION — вставь в приложение:${NC}    │"
+echo -e "  │  ${YELLOW}SERVER URL: http://${SERVER_IP}:${API_PORT}${NC}           │"
+echo -e "  └─────────────────────────────────────────────┘"
 echo ""
 echo -e "  ${YELLOW}Для остановки: bash stop.sh${NC}"
 echo ""
