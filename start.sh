@@ -70,6 +70,12 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
+if ! command -v npm &> /dev/null; then
+    log_error "npm не найден! Установите Node.js и npm."
+    log_info "Команда для установки: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+    exit 1
+fi
+
 if [ ! -d "node_modules" ]; then
     log_info "Installing Node.js dependencies..."
     npm install
