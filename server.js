@@ -246,8 +246,17 @@ app.post('/api/ai/task', async (req, res) => {
   }
 });
 
-app.post('/api/ai/model', (req, res) => {
-  const { model } = req.body;
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  if (db.verifyUser(username, password)) {
+    addLog('server', 'info', `User ${username} logged in`);
+    res.json({ success: true, token: WSS_SECRET_TOKEN });
+  } else {
+    addLog('server', 'warn', `Failed login attempt for user ${username}`);
+    res.status(401).json({ success: false, error: 'Invalid credentials' });
+  }
+});
+
   if (!MODELS[model] && !Object.values(MODELS).some(m => m.id === model)) {
     return res.status(400).json({ error: 'Unknown model' });
   }

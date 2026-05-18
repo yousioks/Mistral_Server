@@ -224,18 +224,35 @@ function cleanupOld(days = 90) {
 // Periodic cleanup every 24h
 setInterval(() => cleanupOld(30), 24 * 60 * 60 * 1000);
 
+db.exec(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password TEXT
+)`);
+
+// Добавить дефолтного пользователя, если нет
+const adminExists = db.prepare('SELECT count(*) as count FROM users').get();
+if (adminExists.count === 0) {
+    db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run('admin', 'admin');
+}
+
+function verifyUser(username, password) {
+    const user = db.prepare('SELECT * FROM users WHERE username = ? AND password = ?').get(username, password);
+    return !!user;
+}
+
 module.exports = {
-  db,
-  addIncident,
-  getIncidents,
-  updateIncident,
-  addLog,
-  getLogs,
-  countLogs,
-  addCveLog,
-  getCveLogs,
-  addBotLog,
-  getBotLogs,
-  getStats,
-  cleanupOld,
+    addIncident,
+    getIncidents,
+    updateIncident,
+    addLog,
+    getLogs,
+    countLogs,
+    addCveLog,
+    getCveLogs,
+    addBotLog,
+    getBotLogs,
+    getStats,
+    cleanupOld,
+    verifyUser
 };
