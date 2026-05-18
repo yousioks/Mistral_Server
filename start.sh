@@ -159,8 +159,8 @@ echo -e "  ${BLUE}Monitors:${NC}           Lua watchers active"
 echo -e "  ${BLUE}Logs:${NC}               $LOG_DIR/"
 echo -e "  ${BLUE}PID files:${NC}          $PID_DIR/"
 echo ""
-echo -e "  ${YELLOW}Press Ctrl+C to stop all services${NC}"
+echo -e "  ${YELLOW}Для остановки: bash stop.sh${NC}"
 echo ""
 
-# Keep script running
-tail -f /dev/null
+# Detach — script exits, services keep running in background
+exit 0
