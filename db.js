@@ -1,20 +1,17 @@
 ﻿const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'mistral.db');
 
-// Ensure data directory exists
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
 const db = new Database(DB_PATH);
-
-// Enable WAL mode for better concurrency
 db.pragma('journal_mode = WAL');
 
-// Create tables
 function initSchema() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS incidents (
@@ -65,18 +62,83 @@ function initSchema() {
       nickname TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      chat_id TEXT,
+      nickname TEXT,
+      role TEXT DEFAULT 'operator',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 }
 
 initSchema();
 
+// Миграция старых БД — добавить колонки если нет
+['chat_id TEXT', 'nickname TEXT', 'role TEXT DEFAULT \'operator\''].forEach(col => {
+  try { db.exec(`ALTER TABLE users ADD COLUMN ${col}`); } catch (_) {}
+});
+
+// Дефолтный admin если таблица пустая
+const adminExists = db.prepare('SELECT count(*) as count FROM users').get();
+if (adminExists.count === 0) {
+  const hash = bcrypt.hashSync('admin', 10);
+  db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)').run('admin', hash, 'admin');
+  console.log('[DB] Default admin created: login=admin password=admin');
+}
+
+// --- Users ---
+function verifyUser(username, password) {
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!user) return false;
+  // Поддержка plain-text паролей (старые записи) — апгрейд до bcrypt на лету
+  if (!user.password.startsWith('$2')) {
+    if (user.password !== password) return false;
+    const hash = bcrypt.hashSync(password, 10);
+    db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hash, user.id);
+    return true;
+  }
+  return bcrypt.compareSync(password, user.password);
+}
+
+function addUser(username, password, chatId, nickname, role) {
+  const hash = bcrypt.hashSync(password, 10);
+  try {
+    db.prepare('INSERT INTO users (username, password, chat_id, nickname, role) VALUES (?, ?, ?, ?, ?)')
+      .run(username, hash, chatId || null, nickname || username, role || 'operator');
+    return true;
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) return false;
+    throw e;
+  }
+}
+
+function getAllUsers() {
+  return db.prepare('SELECT id, username, chat_id, nickname, role, created_at FROM users').all();
+}
+
+function getUserByChatId(chatId) {
+  return db.prepare('SELECT * FROM users WHERE chat_id = ?').get(String(chatId));
+}
+
+function updateUserChatId(username, chatId) {
+  db.prepare('UPDATE users SET chat_id = ? WHERE username = ?').run(String(chatId), username);
+}
+
+// Все chat_id для рассылки уведомлений
+function getAllChatIds() {
+  return db.prepare('SELECT chat_id FROM users WHERE chat_id IS NOT NULL AND chat_id != \'\'').all().map(r => r.chat_id);
+}
+
 // --- Incidents ---
 function addIncident(incident) {
-  const stmt = db.prepare(`
+  db.prepare(`
     INSERT INTO incidents (id, timestamp, severity, monitor, type, description, details, status)
     VALUES (@id, @timestamp, @severity, @monitor, @type, @description, @details, @status)
-  `);
-  stmt.run({
+  `).run({
     id: incident.id || uuidv4(),
     timestamp: incident.timestamp || new Date().toISOString(),
     severity: incident.severity,
@@ -89,13 +151,10 @@ function addIncident(incident) {
   return incident;
 }
 
-function getIncidents({ severity, limit = 100, offset = 0 }) {
+function getIncidents({ severity, limit = 100, offset = 0 } = {}) {
   let sql = 'SELECT * FROM incidents WHERE 1=1';
   const params = [];
-  if (severity) {
-    sql += ' AND severity = ?';
-    params.push(severity);
-  }
+  if (severity) { sql += ' AND severity = ?'; params.push(severity); }
   sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
   return db.prepare(sql).all(...params);
@@ -113,11 +172,10 @@ function updateIncident(id, { status, comment }) {
 
 // --- Logs ---
 function addLog(entry) {
-  const stmt = db.prepare(`
+  db.prepare(`
     INSERT INTO logs (id, timestamp, type, level, message, meta)
     VALUES (@id, @timestamp, @type, @level, @message, @meta)
-  `);
-  stmt.run({
+  `).run({
     id: entry.id || uuidv4(),
     timestamp: entry.timestamp || new Date().toISOString(),
     type: entry.type,
@@ -127,7 +185,7 @@ function addLog(entry) {
   });
 }
 
-function getLogs({ type = 'server', level, startDate, endDate, limit = 100, offset = 0 }) {
+function getLogs({ type = 'server', level, startDate, endDate, limit = 100, offset = 0 } = {}) {
   let sql = 'SELECT * FROM logs WHERE type = ?';
   const params = [type];
   if (level) { sql += ' AND level = ?'; params.push(level); }
@@ -189,7 +247,6 @@ function getStats() {
   const today = new Date().toISOString().slice(0, 10);
   const weekAgo = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);
   const monthAgo = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
-
   return {
     incidents: {
       critical: db.prepare("SELECT COUNT(*) as c FROM incidents WHERE severity = 'CRITICAL'").get().c,
@@ -211,48 +268,22 @@ function getStats() {
   };
 }
 
-// --- Cleanup ---
 function cleanupOld(days = 90) {
   const cutoff = new Date(Date.now() - days * 864e5).toISOString();
   db.prepare('DELETE FROM logs WHERE timestamp < ?').run(cutoff);
   db.prepare('DELETE FROM bot_logs WHERE timestamp < ?').run(cutoff);
   db.prepare('DELETE FROM cve_logs WHERE timestamp < ?').run(cutoff);
   db.prepare('DELETE FROM incidents WHERE timestamp < ? AND status = ?').run(cutoff, 'resolved');
-  console.log(`[DB] Cleaned records older than ${days} days`);
 }
 
-// Periodic cleanup every 24h
 setInterval(() => cleanupOld(30), 24 * 60 * 60 * 1000);
 
-db.exec(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT
-)`);
-
-// Добавить дефолтного пользователя, если нет
-const adminExists = db.prepare('SELECT count(*) as count FROM users').get();
-if (adminExists.count === 0) {
-    db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run('admin', 'admin');
-}
-
-function verifyUser(username, password) {
-    const user = db.prepare('SELECT * FROM users WHERE username = ? AND password = ?').get(username, password);
-    return !!user;
-}
-
 module.exports = {
-    addIncident,
-    getIncidents,
-    updateIncident,
-    addLog,
-    getLogs,
-    countLogs,
-    addCveLog,
-    getCveLogs,
-    addBotLog,
-    getBotLogs,
-    getStats,
-    cleanupOld,
-    verifyUser
+  addIncident, getIncidents, updateIncident,
+  addLog, getLogs, countLogs,
+  addCveLog, getCveLogs,
+  addBotLog, getBotLogs,
+  getStats, cleanupOld,
+  verifyUser, addUser, getAllUsers,
+  getUserByChatId, updateUserChatId, getAllChatIds,
 };

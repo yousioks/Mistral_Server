@@ -1,24 +1,35 @@
 #!/bin/bash
+# ═══════════════════════════════════════════════════════════════════
+#  MISTRAL Defense — Добавление пользователя в БД
+#  Использование: ./add_user.sh <username> <password> [role] [chat_id]
+#  role: operator (по умолчанию) | admin
+# ═══════════════════════════════════════════════════════════════════
 
-# Скрипт для добавления пользователя в БД
-if [ "$#" -ne 2 ]; then
-    echo "Использование: $0 <username> <password>"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ "$#" -lt 2 ]; then
+    echo "Использование: $0 <username> <password> [role] [chat_id]"
+    echo "  role: operator (по умолчанию) | admin"
     exit 1
 fi
 
-USERNAME=$1
-PASSWORD=$2
-DB_PATH="data/mistral.db"
+USERNAME="$1"
+PASSWORD="$2"
+ROLE="${3:-operator}"
+CHAT_ID="${4:-}"
 
-if [ ! -f "$DB_PATH" ]; then
-    echo "Ошибка: База данных не найдена по пути $DB_PATH"
-    exit 1
-fi
-
-sqlite3 "$DB_PATH" "INSERT INTO users (username, password) VALUES ('$USERNAME', '$PASSWORD');"
-
-if [ $? -eq 0 ]; then
-    echo "Пользователь '$USERNAME' успешно добавлен."
-else
-    echo "Ошибка при добавлении пользователя (возможно, он уже существует)."
-fi
+# Добавляем через db.js (bcrypt хеширование автоматически)
+node -e "
+const db = require('./db.js');
+const ok = db.addUser('$USERNAME', '$PASSWORD', '$CHAT_ID' || null, '$USERNAME', '$ROLE');
+if (ok) {
+  console.log('[OK] Пользователь \"$USERNAME\" успешно добавлен (роль: $ROLE).');
+  process.exit(0);
+} else {
+  console.error('[ERROR] Пользователь \"$USERNAME\" уже существует.');
+  process.exit(1);
+}
+"

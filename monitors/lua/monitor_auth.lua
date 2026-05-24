@@ -70,8 +70,7 @@ function get_failed_logins()
     local failed = {}
     for line in out:gmatch("[^\n]+") do
         if line:find("Failed password") or line:find("Invalid user") then
-            local ip = line:match("from%s+(S+)") or "unknown"
-            table.insert(failed, {ip = ip, line = line:sub(-120)})
+            local ip = line:match("from%s+(%S+)") or "unknown"            table.insert(failed, {ip = ip, line = line:sub(-120)})
         end
     end
     return failed

@@ -66,8 +66,7 @@ log_info "Checking dependencies..."
 if [ ! -f ".env" ]; then
     log_warn ".env not found! Copying from .env.example..."
     cp .env.example .env
-    log_warn "Please edit .env and set your API keys before restarting!"
-    exit 1
+    log_warn "Скопирован .env.example -> .env. Отредактируйте токены при необходимости."
 fi
 
 if ! command -v npm &> /dev/null; then
@@ -120,9 +119,10 @@ log_info "[2/3] Starting Telegram Bot..."
 sleep 2
 $NODE_BIN telegram-bot.js > "$LOG_DIR/telegram-bot.log" 2>&1 &
 save_pid "telegram-bot" $!
-sleep 1
+sleep 2
 if kill -0 $(cat "$PID_DIR/telegram-bot.pid") 2>/dev/null; then
-    log_ok "Telegram bot polling started"
+    BOT_HTTP_PORT=$(grep '^BOT_HTTP_PORT=' .env | cut -d= -f2 || echo 8081)
+    log_ok "Telegram bot started (polling + HTTP on port ${BOT_HTTP_PORT})"
 else
     log_warn "Telegram bot may have failed. Check logs/telegram-bot.log"
 fi
