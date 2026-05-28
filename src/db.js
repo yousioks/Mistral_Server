@@ -1,10 +1,10 @@
-﻿const fs = require('fs');
+const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'mistral.db');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '../data', 'mistral.db');
 
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });

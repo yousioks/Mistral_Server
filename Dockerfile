@@ -18,4 +18,4 @@ RUN mkdir -p data logs certs
 EXPOSE 8080 8443
 
 # Default: start server
-CMD ["node", "server.js"]
+CMD ["node", "src/server.js"]

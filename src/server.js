@@ -33,7 +33,7 @@ const MODELS = {
 };
 let activeModel = MODELS.deepseek.id;
 
-const logDir = path.join(__dirname, "logs");
+const logDir = path.join(__dirname, "../logs");
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
 
 const logger = winston.createLogger({
@@ -264,7 +264,7 @@ app.post("/api/ai/model", (req, res) => {
 // ── Scans ────────────────────────────────────────────────────────────────────
 app.post("/api/scan/semgrep", async (req, res) => {
   const { targetDir, rules } = req.body;
-  const result = runSemgrep(targetDir || __dirname, rules);
+  const result = runSemgrep(targetDir || path.join(__dirname, ".."), rules);
   res.json(result);
 });
 app.post("/api/scan/trivy", async (req, res) => {

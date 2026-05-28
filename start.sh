@@ -102,7 +102,7 @@ log_info "═══════════════════════�
 
 # 1. Start Main Server (REST API + WSS)
 log_info "[1/3] Starting MISTRAL Server (REST API + WebSocket)..."
-$NODE_BIN server.js > "$LOG_DIR/server.log" 2>&1 &
+$NODE_BIN src/server.js > "$LOG_DIR/server.log" 2>&1 &
 save_pid "server" $!
 sleep 2
 if kill -0 $(cat "$PID_DIR/server.pid") 2>/dev/null; then
@@ -117,7 +117,7 @@ fi
 # 2. Start Telegram Bot (after server is confirmed running)
 log_info "[2/3] Starting Telegram Bot..."
 sleep 2
-$NODE_BIN telegram-bot.js > "$LOG_DIR/telegram-bot.log" 2>&1 &
+$NODE_BIN src/telegram-bot.js > "$LOG_DIR/telegram-bot.log" 2>&1 &
 save_pid "telegram-bot" $!
 sleep 2
 if kill -0 $(cat "$PID_DIR/telegram-bot.pid") 2>/dev/null; then
@@ -145,7 +145,7 @@ else
 fi
 # 4. Start Log Forwarder
 log_info "[4/4] Starting Log Forwarder..."
-$NODE_BIN log_forwarder.js > "$LOG_DIR/log_forwarder.log" 2>&1 &
+$NODE_BIN src/log_forwarder.js > "$LOG_DIR/log_forwarder.log" 2>&1 &
 save_pid "log_forwarder" $!
 sleep 1
 if kill -0 $(cat "$PID_DIR/log_forwarder.pid") 2>/dev/null; then
