@@ -37,24 +37,47 @@ async function reply(chatId, text, opts = {}) {
   catch (err) { console.error("[Bot] sendMessage error:", err.message); }
 }
 
-async function broadcastAlert(severity, type, description) {
+const incidentsMap = new Map();
+
+async function broadcastAlert(incident) {
   const chatIds = db.getAllChatIds();
   if (!chatIds.length) { console.log("[Bot] Нет chat_id в БД"); return; }
-  const emoji = severity === "CRITICAL" ? "🚨" : severity === "HIGH" ? "⚠️" : "ℹ️";
-  let text = `${emoji} <b>MISTRAL ALERT</b>\n\nУровень: <b>${severity}</b>\nТип: <b>${type}</b>\nОписание: ${description}\n\n<i>${new Date().toLocaleString("ru-RU")}</i>`;
-  if (severity === "CRITICAL" || severity === "HIGH") text += "\n\n🔴 <b>ВОЗМОЖНА УТЕЧКА — ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО!</b>";
-  for (const chatId of chatIds) await reply(chatId, text);
+  
+  const { id, severity, type, description, contextBlock, timestamp } = incident;
+  incidentsMap.set(id, incident);
+  if (incidentsMap.size > 500) {
+    const firstKey = incidentsMap.keys().next().value;
+    incidentsMap.delete(firstKey);
+  }
+
+  const emoji = severity === "CRITICAL" ? "🚨" : severity === "HIGH" ? "⚠️" : severity === "MEDIUM" ? "🟡" : "🟢";
+  let text = `${emoji} <b>MISTRAL ALERT</b>\n\n`;
+  text += `Уровень: <b>${severity}</b>\n`;
+  text += `Тип: <b>${type}</b>\n`;
+  text += `Время: <i>${(timestamp||'').replace('T', ' ').slice(0, 19)}</i>\n\n`;
+  text += `<b>Описание:</b>\n${description}\n`;
+
+  const opts = {};
+  
+  if (severity === "CRITICAL" || severity === "HIGH") {
+    text += `\n🔴 <b>ВНИМАНИЕ: СИСТЕМА ПОД УГРОЗОЙ!</b>\n`;
+    opts.reply_markup = {
+      inline_keyboard: [[{ text: "🧠 АНАЛИЗ ИИ", callback_data: `ai_${id}` }]]
+    };
+  }
+
+  for (const chatId of chatIds) await reply(chatId, text, opts);
 }
 
 const pending = new Map();
 const sessions = new Map();
 
 function mainMenu() {
-  return { reply_markup: { keyboard: [[{ text: "📊 Статус" }, { text: "📋 Инциденты" }], [{ text: "📝 Логи" }, { text: "👥 Пользователи" }]], resize_keyboard: true } };
+  return { reply_markup: { keyboard: [[{ text: "📊 Статус" }, { text: "🚨 Инциденты" }], [{ text: "📝 Логи" }, { text: "👥 Пользователи" }]], resize_keyboard: true } };
 }
 
 async function showMenu(chatId, username) {
-  await reply(chatId, `👋 Привет, <b>${username}</b>!\n\nMISTRAL Defense активна. Выберите раздел:`, mainMenu());
+  await reply(chatId, `👋 Привет, <b>${username}</b>!\n\n🛡 <b>MISTRAL Defense Command</b> активна.\nВыберите действие:`, mainMenu());
 }
 
 bot.onText(/\/start/, async (msg) => {
@@ -64,14 +87,54 @@ bot.onText(/\/start/, async (msg) => {
   await reply(chatId, "🔐 <b>MISTRAL Defense</b>\n\nВведите логин:", { reply_markup: { remove_keyboard: true } });
 });
 
+bot.on("callback_query", async (query) => {
+  const chatId = query.message.chat.id;
+  const data = query.data;
+
+  if (data.startsWith("ai_")) {
+    const incId = data.split("_")[1];
+    bot.answerCallbackQuery(query.id, { text: "Отправка логов в ИИ..." });
+    
+    const inc = incidentsMap.get(incId);
+    if (!inc) {
+      await reply(chatId, "❌ Инцидент не найден в кэше.");
+      return;
+    }
+
+    const waitMsg = await bot.sendMessage(chatId, "⏳ <b>ИИ анализирует...</b>\n<i>Проверяю логи, ищу аномалии...</i>", { parse_mode: "HTML" });
+    
+    try {
+      const prompt = `Проанализируй опасный участок логов. Тип атаки: ${inc.type}. Описание: ${inc.description}.\n\nКонтекст:\n${inc.contextBlock || "Нет логов"}\n\nЧто делает атакующий и какие срочные меры предпринять? Ничего не отключай и не ломай.`;
+      
+      const res = await apiRequest("POST", "/api/ai/task", { task: prompt });
+      
+      if (res.error) {
+        await bot.editMessageText(`❌ Ошибка ИИ: ${res.error}`, { chat_id: chatId, message_id: waitMsg.message_id });
+      } else {
+        const text = `🧠 <b>Ответ ИИ (${res.model}):</b>\n\n${res.result}`;
+        // Telegram msg size limit is 4096, split if needed
+        if (text.length > 4000) {
+          await bot.editMessageText(text.slice(0, 4000) + "...", { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: "HTML" });
+        } else {
+          await bot.editMessageText(text, { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: "HTML" });
+        }
+      }
+    } catch (e) {
+      await bot.editMessageText("⚠️ Ошибка связи с API ИИ", { chat_id: chatId, message_id: waitMsg.message_id });
+    }
+  }
+});
+
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
   const state = pending.get(chatId);
 
+  if (text.startsWith("/")) return; // Handled by onText
+
   if (state && state.step === "login") {
     pending.set(chatId, { step: "password", username: text });
-    await reply(chatId, "Введите пароль:", { reply_markup: { remove_keyboard: true } });
+    await reply(chatId, "🔑 Введите пароль:", { reply_markup: { remove_keyboard: true } });
     return;
   }
 
@@ -85,12 +148,12 @@ bot.on("message", async (msg) => {
       apiRequest("POST", "/api/bot-log", { level: "info", message: `Telegram login: ${username}`, meta: { chatId: String(chatId), username } }).catch(() => {});
       await showMenu(chatId, username);
     } else {
-      await reply(chatId, "❌ Неверный логин или пароль.\n/start — повторить.");
+      await reply(chatId, "❌ Неверный логин или пароль.\n/start — повторить авторизацию.");
     }
     return;
   }
 
-  if (!sessions.get(chatId)?.authenticated) { await reply(chatId, "🔒 Требуется авторизация. /start"); return; }
+  if (!sessions.get(chatId)?.authenticated) { await reply(chatId, "🔒 Требуется авторизация.\nНажмите /start"); return; }
 
   const username = sessions.get(chatId).username;
 
@@ -98,16 +161,25 @@ bot.on("message", async (msg) => {
     try {
       const stats = await apiRequest("GET", "/api/stats");
       const inc = stats.incidents || {}, logs = stats.logs || {};
-      await reply(chatId, `📊 <b>Статус системы</b>\n\n🚨 Критических: <b>${inc.critical||0}</b>\n⚠️ Высоких: <b>${inc.high||0}</b>\n🟡 Средних: <b>${inc.medium||0}</b>\n🟢 Низких: <b>${inc.low||0}</b>\n\n📝 Логов сегодня: <b>${logs.today||0}</b>\n📝 За неделю: <b>${logs.week||0}</b>\n👥 Онлайн: <b>${stats.connectedClients||0}</b>`, mainMenu());
+      const t = `📊 <b>СТАТУС СЕРВЕРА</b>
+      
+🚨 Критических: <b>${inc.critical||0}</b>
+⚠️ Высоких: <b>${inc.high||0}</b>
+🟡 Средних: <b>${inc.medium||0}</b>
+🟢 Низких: <b>${inc.low||0}</b>
+
+📝 Логов сегодня: <b>${logs.today||0}</b>
+👥 Подключено Web-клиентов: <b>${stats.connectedClients||0}</b>`;
+      await reply(chatId, t, mainMenu());
     } catch (e) { await reply(chatId, "⚠️ Сервер недоступен", mainMenu()); }
     return;
   }
 
-  if (text === "📋 Инциденты") {
+  if (text === "🚨 Инциденты") {
     try {
-      const data = await apiRequest("GET", "/api/incidents?limit=10");
-      const list = (data.data || []).slice(0,10).map(i => `• [${i.severity}] ${i.type}: ${(i.description||"").slice(0,80)}`).join("\n") || "Инцидентов нет.";
-      await reply(chatId, `📋 <b>Последние инциденты:</b>\n\n${list}`, mainMenu());
+      const data = await apiRequest("GET", "/api/incidents?limit=5");
+      const list = (data.data || []).slice(0,5).map(i => `• <b>[${i.severity}]</b> ${i.type}\n  <i>${(i.description||"").slice(0,100)}</i>`).join("\n\n") || "Инцидентов нет.";
+      await reply(chatId, `🚨 <b>Последние 5 инцидентов:</b>\n\n${list}`, mainMenu());
     } catch (e) { await reply(chatId, "⚠️ Ошибка", mainMenu()); }
     return;
   }
@@ -115,8 +187,8 @@ bot.on("message", async (msg) => {
   if (text === "📝 Логи") {
     try {
       const data = await apiRequest("GET", "/api/logs?type=server&limit=10");
-      const list = (data.data || []).slice(0,10).map(l => `• [${(l.level||"info").toUpperCase()}] ${(l.message||"").slice(0,80)}`).join("\n") || "Логов нет.";
-      await reply(chatId, `📝 <b>Последние логи:</b>\n\n${list}`, mainMenu());
+      const list = (data.data || []).slice(0,10).map(l => `<code>[${(l.level||"INFO").toUpperCase()}] ${(l.message||"").slice(0,60)}</code>`).join("\n") || "Логов нет.";
+      await reply(chatId, `📝 <b>Свежие логи:</b>\n\n${list}`, mainMenu());
     } catch (e) { await reply(chatId, "⚠️ Ошибка", mainMenu()); }
     return;
   }
@@ -131,12 +203,11 @@ bot.on("message", async (msg) => {
   }
 });
 
-// HTTP-сервер: принимает POST /api/bot-notify от server.js и рассылает алерты
 const botApp = express();
-botApp.use(express.json());
+botApp.use(express.json({ limit: "50mb" }));
 botApp.post("/api/bot-notify", async (req, res) => {
-  const { severity, type, description } = req.body || {};
-  if (severity && type && description) await broadcastAlert(severity, type, description);
+  const incident = req.body;
+  if (incident && incident.severity) await broadcastAlert(incident);
   res.json({ ok: true });
 });
 botApp.listen(Number(BOT_HTTP_PORT), () => console.log(`[Bot] HTTP listener on port ${BOT_HTTP_PORT}`));

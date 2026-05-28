@@ -1,4 +1,4 @@
-﻿require("dotenv").config();
+require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -57,7 +57,8 @@ const AI_SAFETY_RULES = `STRICT RULES: You are a defensive security assistant.
 2. NEVER stop nginx or modify SSL certificates.
 3. NEVER delete system files, logs, or config files.
 4. NEVER create user accounts without explicit approval.
-5. ALWAYS explain before doing. ALWAYS prefer monitoring over intervention.`;
+5. ALWAYS explain before doing. ALWAYS prefer monitoring over intervention.
+6. CRITICAL: DO NOT break the structure of the application. Do not try to escape the server sandbox. Do not shutdown or reboot the server.`;
 
 function sanitizeAIInput(task) {
   const forbidden = [/ufw\s+(disable|reset)/i, /rm\s+-rf\s+\//i, /mkfs\./i, /dd\s+if=/i];
@@ -87,22 +88,22 @@ function addLog(type, level, message, meta = {}) {
 }
 
 function addIncident(severity, monitor, type, description, details = {}) {
-  const incident = { id: uuidv4(), timestamp: new Date().toISOString(), severity, monitor, type, description, details, status: "new" };
+  const contextLogs = serverLogs.slice(-100).map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
+  const incident = { id: uuidv4(), timestamp: new Date().toISOString(), severity, monitor, type, description, details, status: "new", contextBlock: contextLogs };
   try { db.addIncident(incident); } catch (e) { logger.error("DB addIncident failed", { err: e.message }); }
   incidents.unshift(incident);
   if (incidents.length > 5000) incidents.pop();
   addLog("server", severity === "CRITICAL" ? "error" : "warn", `Incident: ${type}`, incident);
   broadcast({ event: "incident", data: incident });
-  // Уведомить всех пользователей в Telegram через HTTP к боту
-  notifyTelegram(severity, type, description);
+  notifyTelegram(incident);
   return incident;
 }
 
 const BOT_HTTP_PORT = process.env.BOT_HTTP_PORT || 8081;
 
-function notifyTelegram(severity, type, description) {
+function notifyTelegram(incident) {
   try {
-    const body = JSON.stringify({ severity, type, description });
+    const body = JSON.stringify(incident);
     const req = http.request({
       hostname: "localhost", port: Number(BOT_HTTP_PORT),
       path: "/api/bot-notify", method: "POST",
@@ -241,7 +242,8 @@ app.get("/api/stats", (_req, res) => {
 app.post("/api/ai/task", async (req, res) => {
   const { model, task, systemPrompt } = req.body;
   const apiKey = req.headers["x-api-key"];
-  if (apiKey !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+  const isLocal = req.ip === "::1" || req.ip === "127.0.0.1" || req.ip === "::ffff:127.0.0.1";
+  if (apiKey !== WSS_SECRET_TOKEN && !isLocal) return res.status(403).json({ error: "Unauthorized" });
   try {
     sanitizeAIInput(task);
     const msgs = [{ role: "system", content: AI_SAFETY_RULES }];
@@ -377,6 +379,7 @@ function startWSS(server) {
 }
 
 function ensureCerts() {
+  if (process.env.FORCE_HTTPS !== "true") return null; // Avoid self-signed certs blocking WS connection in browser
   const certDir = path.dirname(WSS_CERT_PATH);
   if (!fs.existsSync(certDir)) fs.mkdirSync(certDir, { recursive: true });
   if (!fs.existsSync(WSS_CERT_PATH) || !fs.existsSync(WSS_KEY_PATH)) {

@@ -143,7 +143,16 @@ if [ -n "$LUA_BIN" ] && [ -x "$LUA_BIN" ]; then
 else
     log_warn "Skipping Lua monitors — Lua not available"
 fi
-
+# 4. Start Log Forwarder
+log_info "[4/4] Starting Log Forwarder..."
+$NODE_BIN log_forwarder.js > "$LOG_DIR/log_forwarder.log" 2>&1 &
+save_pid "log_forwarder" $!
+sleep 1
+if kill -0 $(cat "$PID_DIR/log_forwarder.pid") 2>/dev/null; then
+    log_ok "Log forwarder running (System & Docker)"
+else
+    log_warn "Log forwarder may have failed. Check logs/log_forwarder.log"
+fi
 # ═══ Status ════════════════════════════════════════════════════════════════
 echo ""
 log_info "═══════════════════════════════════════════"
