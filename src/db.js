@@ -72,6 +72,13 @@ function initSchema() {
       role TEXT DEFAULT 'operator',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS quarantine (
+      ip TEXT PRIMARY KEY,
+      reason TEXT,
+      timestamp TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 }
 
@@ -160,14 +167,31 @@ function getIncidents({ severity, limit = 100, offset = 0 } = {}) {
   return db.prepare(sql).all(...params);
 }
 
-function updateIncident(id, { status, comment }) {
+function updateIncident(id, { status, comment, severity }) {
   const sets = [];
   const params = [];
   if (status) { sets.push('status = ?'); params.push(status); }
   if (comment !== undefined) { sets.push('comment = ?'); params.push(comment); }
+  if (severity) { sets.push('severity = ?'); params.push(severity); }
   if (sets.length === 0) return;
   params.push(id);
   db.prepare(`UPDATE incidents SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+}
+
+// --- Quarantine ---
+function addQuarantine(ip, reason) {
+  db.prepare(`
+    INSERT OR REPLACE INTO quarantine (ip, reason, timestamp)
+    VALUES (?, ?, ?)
+  `).run(ip, reason || 'Manual block', new Date().toISOString());
+}
+
+function removeQuarantine(ip) {
+  db.prepare('DELETE FROM quarantine WHERE ip = ?').run(ip);
+}
+
+function getQuarantinedIps() {
+  return db.prepare('SELECT * FROM quarantine ORDER BY timestamp DESC').all();
 }
 
 // --- Logs ---
@@ -286,4 +310,5 @@ module.exports = {
   getStats, cleanupOld,
   verifyUser, addUser, getAllUsers,
   getUserByChatId, updateUserChatId, getAllChatIds,
+  addQuarantine, removeQuarantine, getQuarantinedIps
 };

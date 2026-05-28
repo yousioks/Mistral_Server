@@ -206,11 +206,47 @@ app.post("/api/incidents", (req, res) => {
 app.patch("/api/incidents/:id", (req, res) => {
   const incident = incidents.find(i => i.id === req.params.id);
   if (!incident) return res.status(404).json({ error: "Not found" });
-  const { status, comment } = req.body;
+  const { status, comment, severity } = req.body;
   if (status) { incident.status = status; try { db.updateIncident(req.params.id, { status }); } catch (_) {} }
   if (comment) { incident.comment = comment; try { db.updateIncident(req.params.id, { comment }); } catch (_) {} }
+  if (severity) { incident.severity = severity; try { db.updateIncident(req.params.id, { severity }); } catch (_) {} }
   broadcast({ event: "incident_updated", data: incident });
   res.json(incident);
+});
+
+// ── Quarantine ─────────────────────────────────────────────────────────────
+app.get("/api/quarantine", (req, res) => {
+  try { res.json(db.getQuarantinedIps()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/quarantine", (req, res) => {
+  const { ip, reason } = req.body;
+  if (!ip) return res.status(400).json({ error: "IP required" });
+  try {
+    const { execSync } = require("child_process");
+    execSync(`ufw deny from ${ip} to any`, { stdio: "ignore" }); // Mockable via dry-run later if needed, but assuming ufw exists
+  } catch (e) {
+    logger.warn(`UFW block failed for ${ip}: ${e.message}`);
+  }
+  db.addQuarantine(ip, reason);
+  addLog("server", "warn", `IP Quarantined: ${ip}`, { ip, reason });
+  broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+  res.json({ success: true, ip });
+});
+
+app.delete("/api/quarantine/:ip", (req, res) => {
+  const ip = req.params.ip;
+  try {
+    const { execSync } = require("child_process");
+    execSync(`ufw delete deny from ${ip} to any`, { stdio: "ignore" });
+  } catch (e) {
+    logger.warn(`UFW unblock failed for ${ip}: ${e.message}`);
+  }
+  db.removeQuarantine(ip);
+  addLog("server", "info", `IP Un-quarantined: ${ip}`, { ip });
+  broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+  res.json({ success: true, ip });
 });
 
 // ── Metrics (от Lua-мониторов) ───────────────────────────────────────────────
@@ -320,6 +356,7 @@ function startWSS(server) {
             ws.send(JSON.stringify({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } }));
             ws.send(JSON.stringify({ event: "incidents_list", data: incidents.slice(0, 100) }));
             ws.send(JSON.stringify({ event: "logs_list", data: serverLogs.slice(0, 200) }));
+            ws.send(JSON.stringify({ event: "quarantine_updated", data: db.getQuarantinedIps() }));
           } else {
             addLog("server", "warn", "WS auth failed: bad token", { clientId, ip });
             ws.close(4003, "Invalid token");
