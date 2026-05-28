@@ -80,8 +80,25 @@ async function showMenu(chatId, username) {
   await reply(chatId, `👋 Привет, <b>${username}</b>!\n\n🛡 <b>MISTRAL Defense Command</b> активна.\nВыберите действие:`, mainMenu());
 }
 
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/\/start(.*)/, async (msg, match) => {
   const chatId = msg.chat.id;
+  const context = (match[1] || "").trim();
+
+  // Обработка контекста с фронтенда (Remon)
+  if (context === "register") {
+    await reply(chatId, "📋 <b>Регистрация резидента Remon</b>\n\nЧтобы создать аккаунт, пожалуйста, перейдите на сайт:\n👉 <a href='https://raemon.ru/register'>Зарегистрироваться</a>");
+    return;
+  }
+  if (context === "recover") {
+    await reply(chatId, "🔑 <b>Восстановление пароля</b>\n\nДля восстановления доступа к аккаунту Remon, обратитесь в службу поддержки или перейдите по ссылке:\n👉 <a href='https://raemon.ru/recover'>Восстановить пароль</a>");
+    return;
+  }
+  if (context === "login") {
+    await reply(chatId, "🚪 <b>Вход для резидентов</b>\n\nДля входа в личный кабинет Remon перейдите на сайт:\n👉 <a href='https://raemon.ru/login'>Войти</a>\n\n<i>(Если вы администратор сервера MISTRAL, отправьте любой текст для начала авторизации)</i>");
+    return;
+  }
+
+  // Стандартная авторизация администратора MISTRAL
   if (sessions.get(chatId)?.authenticated) { await showMenu(chatId, sessions.get(chatId).username); return; }
   pending.set(chatId, { step: "login" });
   await reply(chatId, "🔐 <b>MISTRAL Defense</b>\n\nВведите логин:", { reply_markup: { remove_keyboard: true } });

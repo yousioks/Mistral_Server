@@ -23,7 +23,7 @@ CHAT_ID="${4:-}"
 
 # Добавляем через db.js (bcrypt хеширование автоматически)
 node -e "
-const db = require('./db.js');
+const db = require('./src/db.js');
 const ok = db.addUser('$USERNAME', '$PASSWORD', '$CHAT_ID' || null, '$USERNAME', '$ROLE');
 if (ok) {
   console.log('[OK] Пользователь \"$USERNAME\" успешно добавлен (роль: $ROLE).');
