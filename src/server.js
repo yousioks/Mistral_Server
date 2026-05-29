@@ -455,7 +455,62 @@ function ensureCerts() {
   catch (e) { return null; }
 }
 
+function loadPersistedData() {
+  try {
+    const dbIncidents = db.getIncidents({ limit: 1000 }) || [];
+    dbIncidents.forEach(i => {
+      if (typeof i.details === "string") {
+        try { i.details = JSON.parse(i.details); } catch (_) {}
+      }
+    });
+    incidents.push(...dbIncidents);
+    logger.info(`Loaded ${incidents.length} incidents from database`);
+  } catch (e) {
+    logger.error("Failed to load initial incidents from DB", { err: e.message });
+  }
+
+  try {
+    const dbLogs = db.getLogs({ type: "server", limit: 2000 }) || [];
+    dbLogs.forEach(l => {
+      if (typeof l.meta === "string") {
+        try { l.meta = JSON.parse(l.meta); } catch (_) {}
+      }
+    });
+    serverLogs.push(...dbLogs.reverse());
+    logger.info(`Loaded ${serverLogs.length} server logs from database`);
+  } catch (e) {
+    logger.error("Failed to load initial server logs from DB", { err: e.message });
+  }
+
+  try {
+    const dbBotLogs = db.getLogs({ type: "bot", limit: 2000 }) || [];
+    dbBotLogs.forEach(l => {
+      if (typeof l.meta === "string") {
+        try { l.meta = JSON.parse(l.meta); } catch (_) {}
+      }
+    });
+    botLogs.push(...dbBotLogs.reverse());
+    logger.info(`Loaded ${botLogs.length} bot logs from database`);
+  } catch (e) {
+    logger.error("Failed to load initial bot logs from DB", { err: e.message });
+  }
+
+  try {
+    const dbCveLogs = db.getLogs({ type: "cve", limit: 2000 }) || [];
+    dbCveLogs.forEach(l => {
+      if (typeof l.meta === "string") {
+        try { l.meta = JSON.parse(l.meta); } catch (_) {}
+      }
+    });
+    cveLogs.push(...dbCveLogs.reverse());
+    logger.info(`Loaded ${cveLogs.length} cve logs from database`);
+  } catch (e) {
+    logger.error("Failed to load initial cve logs from DB", { err: e.message });
+  }
+}
+
 function start() {
+  loadPersistedData();
   const certs = ensureCerts();
   let server;
   if (certs) {
