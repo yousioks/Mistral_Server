@@ -235,6 +235,21 @@ while true do
             })
         end
 
+        -- generate incident if someone touches the honeypot
+        local honeypot_triggered = false
+        for _, log in ipairs(audits) do
+            if log.message:find("remon_payment_gateway") then
+                honeypot_triggered = true
+            end
+        end
+        if honeypot_triggered then
+            table.insert(anomalies, {
+                severity = "CRITICAL",
+                type = "HONEYPOT_TRIGGERED",
+                description = "СРАБАТЫВАНИЕ ХАНИПОТА! Атакующий взаимодействует с фейковым контейнером remon_payment_gateway."
+            })
+        end
+
         for _, a in ipairs(anomalies) do
             io.stderr:write("[ALERT] " .. a.description .. "\n")
             post_json("/api/incidents", {
