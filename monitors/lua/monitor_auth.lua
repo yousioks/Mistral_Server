@@ -84,6 +84,47 @@ function get_ssh_keys_info()
     return {size = #data, lines = select(2, data:gsub("\n", "\n"))}
 end
 
+function get_audit_logs(since_time)
+    if not since_time then return {} end
+    local cmd = string.format("journalctl -t mistral-audit --since '%s' -q --no-pager 2>/dev/null", since_time)
+    local out = read_cmd(cmd)
+    local logs = {}
+    for line in out:gmatch("[^\n]+") do
+        local user = line:match("USER=([^%s]+)")
+        local ip = line:match("IP=([^%s]+)")
+        local command = line:match("CMD=(.+)")
+        if user and command then
+            local level = "info"
+            if command:find("docker") or command:find("rm ") or command:find("kill") then level = "warn" end
+            table.insert(logs, {
+                type = "audit",
+                level = level,
+                message = string.format("[Audit] %s (IP: %s) ran: %s", user, ip or "unknown", command)
+            })
+        end
+    end
+    return logs
+end
+
+function get_successful_logins(since_time)
+    if not since_time then return {} end
+    local cmd = string.format("journalctl _COMM=sshd --since '%s' -q --no-pager 2>/dev/null", since_time)
+    local out = read_cmd(cmd)
+    local logs = {}
+    for line in out:gmatch("[^\n]+") do
+        if line:find("Accepted password") or line:find("Accepted publickey") then
+            local user = line:match("for%s+([^%s]+)")
+            local ip = line:match("from%s+([^%s]+)")
+            table.insert(logs, {
+                type = "auth",
+                level = "info",
+                message = string.format("[SSH] Successful login for %s from %s", user or "?", ip or "?")
+            })
+        end
+    end
+    return logs
+end
+
 -- ── Anomaly detection ───────────────────────────────────────────────
 function check_anomalies(data, prev_keys)
     local anomalies = {}
@@ -141,7 +182,10 @@ end
 -- ── Main loop ───────────────────────────────────────────────────────
 print("[Monitor B] Auth Watcher started (Lua)")
 local prev_keys = nil
+local last_time = os.date("%Y-%m-%d %H:%M:%S", os.time() - INTERVAL - 2)
+
 while true do
+    local current_time = os.date("%Y-%m-%d %H:%M:%S")
     local ok, err = pcall(function()
         local ssh_sessions = get_ssh_sessions()
         local sudo_sessions = get_sudo_sessions()
@@ -163,7 +207,33 @@ while true do
         prev_keys = keys_info
 
         local sent = post_json("/api/metrics", data)
-        if sent then print("[Monitor B] Sent") else io.stderr:write("[Monitor B] Send failed\n") end
+        if sent then print("[Monitor B] Sent metrics") else io.stderr:write("[Monitor B] Send failed\n") end
+
+        -- fetch and send logs
+        local audits = get_audit_logs(last_time)
+        local success_logins = get_successful_logins(last_time)
+        
+        for _, log in ipairs(audits) do
+            post_json("/api/logs", log)
+        end
+        for _, log in ipairs(success_logins) do
+            post_json("/api/logs", log)
+        end
+        
+        -- generate incident if someone is spamming docker commands
+        local docker_count = 0
+        for _, log in ipairs(audits) do
+            if log.message:find("docker stop") or log.message:find("docker rm") then
+                docker_count = docker_count + 1
+            end
+        end
+        if docker_count > 0 then
+            table.insert(anomalies, {
+                severity = "HIGH",
+                type = "DOCKER_TAMPERING",
+                description = "Обнаружено выключение/удаление Docker-контейнеров пользователем! Проверьте логи."
+            })
+        end
 
         for _, a in ipairs(anomalies) do
             io.stderr:write("[ALERT] " .. a.description .. "\n")
@@ -179,5 +249,6 @@ while true do
     if not ok then
         io.stderr:write("[Monitor B] Error: " .. tostring(err) .. "\n")
     end
+    last_time = current_time
     require("socket").sleep(INTERVAL)
 end
