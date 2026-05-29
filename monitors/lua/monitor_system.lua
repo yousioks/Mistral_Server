@@ -142,6 +142,16 @@ function get_nginx()
     return {active = data == "active"}
 end
 
+function get_top_process()
+    local data = read_cmd("ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -n 2 | tail -n 1")
+    if not data then return nil end
+    local pid, name, cpu, mem = data:match("%s*(%d+)%s+(%S+)%s+(%d+%.?%d*)%s+(%d+%.?%d*)")
+    if pid then
+        return { pid = tonumber(pid), name = name, cpu = tonumber(cpu), mem = tonumber(mem) }
+    end
+    return nil
+end
+
 -- ── Anomaly detection ───────────────────────────────────────────────
 local CPU_THRESHOLD = tonumber(os.getenv("CPU_THRESHOLD")) or 85
 local RAM_THRESHOLD = tonumber(os.getenv("RAM_THRESHOLD")) or 90
@@ -186,6 +196,7 @@ while true do
         local docker = get_docker()
         local systemd = get_systemd()
         local nginx = get_nginx()
+        local top_process = get_top_process()
 
         local metrics = {
             monitor = "system_anomaly_watcher",
@@ -199,6 +210,7 @@ while true do
             docker = docker,
             systemd = systemd,
             nginx = nginx,
+            top_process = top_process,
         }
 
         local anomalies = check_anomalies(metrics)

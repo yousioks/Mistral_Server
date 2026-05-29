@@ -87,13 +87,23 @@ function addLog(type, level, message, meta = {}) {
   return entry;
 }
 
+function autoCategorizeSeverity(type, desc, original) {
+  const t = (type + " " + (desc || "")).toLowerCase();
+  if (t.includes("rce") || t.includes("sql") || t.includes("systemd failed") || t.includes("nginx неактивен") || t.includes("root")) return "CRITICAL";
+  if (t.includes("brute force") || t.includes("docker") || t.includes("malware") || t.includes("ddos")) return "HIGH";
+  if (t.includes("high_cpu") || t.includes("high_ram") || t.includes("high_disk") || t.includes("xss") || t.includes("anomaly")) return "MEDIUM";
+  if (t.includes("scan") || t.includes("ping") || t.includes("auth")) return "LOW";
+  return original || "MEDIUM";
+}
+
 function addIncident(severity, monitor, type, description, details = {}) {
+  const finalSeverity = autoCategorizeSeverity(type, description, severity);
   const contextLogs = serverLogs.slice(-100).map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
-  const incident = { id: uuidv4(), timestamp: new Date().toISOString(), severity, monitor, type, description, details, status: "new", contextBlock: contextLogs };
+  const incident = { id: uuidv4(), timestamp: new Date().toISOString(), severity: finalSeverity, monitor, type, description, details, status: "new", contextBlock: contextLogs };
   try { db.addIncident(incident); } catch (e) { logger.error("DB addIncident failed", { err: e.message }); }
   incidents.unshift(incident);
   if (incidents.length > 5000) incidents.pop();
-  addLog("server", severity === "CRITICAL" ? "error" : "warn", `Incident: ${type}`, incident);
+  addLog("server", finalSeverity === "CRITICAL" ? "error" : "warn", `Incident: ${type}`, incident);
   broadcast({ event: "incident", data: incident });
   notifyTelegram(incident);
   return incident;
@@ -247,6 +257,21 @@ app.delete("/api/quarantine/:ip", (req, res) => {
   addLog("server", "info", `IP Un-quarantined: ${ip}`, { ip });
   broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
   res.json({ success: true, ip });
+});
+
+// ── Process Management ───────────────────────────────────────────────────────
+app.delete("/api/process/:pid", (req, res) => {
+  const pid = parseInt(req.params.pid, 10);
+  if (!pid) return res.status(400).json({ error: "Invalid PID" });
+  try {
+    const { execSync } = require("child_process");
+    execSync(`kill -9 ${pid}`, { stdio: "ignore" });
+    addLog("server", "info", `Killed process PID: ${pid}`);
+    res.json({ success: true, pid });
+  } catch (e) {
+    logger.error(`Failed to kill PID ${pid}`, { err: e.message });
+    res.status(500).json({ error: "Failed to kill process" });
+  }
 });
 
 // ── Metrics (от Lua-мониторов) ───────────────────────────────────────────────
