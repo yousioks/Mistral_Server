@@ -144,7 +144,7 @@ else
     log_warn "Skipping Lua monitors — Lua not available"
 fi
 # 4. Start Log Forwarder
-log_info "[4/4] Starting Log Forwarder..."
+log_info "[4/5] Starting Log Forwarder..."
 $NODE_BIN src/log_forwarder.js > "$LOG_DIR/log_forwarder.log" 2>&1 &
 save_pid "log_forwarder" $!
 sleep 1
@@ -153,6 +153,16 @@ if kill -0 $(cat "$PID_DIR/log_forwarder.pid") 2>/dev/null; then
 else
     log_warn "Log forwarder may have failed. Check logs/log_forwarder.log"
 fi
+
+# 5. Start Honeypot & Setup Audit
+log_info "[5/5] Setting up security and honeypot..."
+if [ -f "install_audit.sh" ]; then
+    sudo bash install_audit.sh > "$LOG_DIR/install_audit.log" 2>&1 || log_warn "Failed to install audit hook. Please run 'sudo bash install_audit.sh' manually."
+fi
+if [ -f "start_honeypot.sh" ]; then
+    sudo bash start_honeypot.sh > "$LOG_DIR/start_honeypot.log" 2>&1 || log_warn "Failed to start honeypot container."
+fi
+
 # ═══ Status ════════════════════════════════════════════════════════════════
 echo ""
 log_info "═══════════════════════════════════════════"
