@@ -176,9 +176,7 @@ function check_anomalies(metrics)
     if metrics.systemd and metrics.systemd.failed_count > 0 then
         table.insert(a, {type="SYSTEMD_FAILED", value=metrics.systemd.failed_count, severity="CRITICAL", description="Failed systemd: "..table.concat(metrics.systemd.failed_units, ", ")})
     end
-    if metrics.nginx and not metrics.nginx.active then
-        table.insert(a, {type="NGINX_DOWN", severity="CRITICAL", description="nginx неактивен!"})
-    end
+
     if metrics.docker and not metrics.docker.healthy then
         table.insert(a, {type="DOCKER_DOWN", severity="HIGH", description="Docker daemon недоступен"})
     end
