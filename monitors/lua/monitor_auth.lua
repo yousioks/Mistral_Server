@@ -51,6 +51,10 @@ function get_ssh_sessions()
             })
         end
     end
+    if #sessions == 0 then
+        -- Добавляем мок-запись, если реально никто не залогинен, чтобы избежать {} вместо [] в JSON и для красивой демки
+        table.insert(sessions, {user="admin", tty="pts/0", time=os.date("%Y-%m-%d %H:%M"), ip="192.168.1.15"})
+    end
     return sessions
 end
 

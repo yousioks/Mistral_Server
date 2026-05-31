@@ -138,8 +138,9 @@ function get_systemd()
 end
 
 function get_nginx()
-    local data = read_cmd("systemctl is-active nginx 2>/dev/null")
-    return {active = data == "active"}
+    local sys_active = read_cmd("systemctl is-active nginx 2>/dev/null") == "active"
+    local docker_active = read_cmd("docker ps | grep nginx") ~= ""
+    return {active = sys_active or docker_active}
 end
 
 function get_top_process()
