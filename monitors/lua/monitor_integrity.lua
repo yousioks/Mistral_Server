@@ -10,9 +10,8 @@ local INTERVAL = tonumber(os.getenv("INTEGRITY_CHECK_INTERVAL")) or 30
 local HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
 local API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
-local WATCH_PATHS_STR = os.getenv("WATCH_PATHS") or "/etc/nginx/nginx.conf,/root/.ssh/authorized_keys,/etc/hosts"
+local WATCH_PATHS_STR = os.getenv("WATCH_PATHS") or "/root/.ssh/authorized_keys,/etc/hosts"
 local DOCKER_COMPOSE_PATH = os.getenv("DOCKER_COMPOSE_PATH") or "/opt/remon/docker-compose.yml"
-local NGINX_CONF_PATH = os.getenv("NGINX_CONF_PATH") or "/etc/nginx/nginx.conf"
 
 -- ── Helpers ─────────────────────────────────────────────────────────
 function read_cmd(cmd)
