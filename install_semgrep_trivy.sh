@@ -19,8 +19,8 @@ if ! command -v semgrep &> /dev/null; then
     echo "[+] Installing python3-pip..."
     apt-get install -y python3-pip > /dev/null
     echo "[+] Installing semgrep via pip..."
-    pip3 install semgrep > /dev/null
-    if [ $? -eq 0 ]; then
+    pip3 install semgrep --break-system-packages > /dev/null || { echo "Falling back to pipx..."; apt-get install -y pipx > /dev/null && pipx install semgrep > /dev/null && ln -s /root/.local/bin/semgrep /usr/local/bin/semgrep; }
+    if command -v semgrep &> /dev/null; then
         echo "[+] Semgrep installed successfully!"
     else
         echo "[-] Failed to install Semgrep."
