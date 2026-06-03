@@ -697,6 +697,75 @@ app.get("/api/ai-reports/:id", (req, res) => {
   }
 });
 
+// ── Reset Demo State ────────────────────────────────────────────────────────
+app.post("/api/reset-demo", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    // 1. Release all quarantined IPs from UFW
+    const qList = db.getQuarantinedIps() || [];
+    const { execSync } = require("child_process");
+    qList.forEach(q => {
+      try {
+        execSync(`ufw delete deny from ${q.ip} to any`, { stdio: "ignore" });
+      } catch (e) {
+        logger.warn(`UFW delete deny failed for ${q.ip} during reset`, { err: e.message });
+      }
+    });
+
+    // 2. Clear database tables
+    db.resetDemoData();
+
+    // 3. Clear memory arrays
+    incidents.length = 0;
+    serverLogs.length = 0;
+    botLogs.length = 0;
+    cveLogs.length = 0;
+
+    // 4. Delete generated reports on disk, preserving documentation
+    if (fs.existsSync(reportsDir)) {
+      const files = fs.readdirSync(reportsDir);
+      files.forEach(file => {
+        if (file.endsWith(".md") && file !== "report-task-diploma-stack-and-actions.md") {
+          try {
+            fs.unlinkSync(path.join(reportsDir, file));
+          } catch (e) {
+            logger.warn(`Failed to delete report file ${file} during reset`, { err: e.message });
+          }
+        }
+      });
+    }
+
+    // 5. Reset SOAR settings
+    soarSettings = {
+      autoBanDdos: false,
+      autoBanBruteForce: false,
+      aiDefenseEnabled: false,
+      aiMakeChanges: true,
+      aiModel: "deepseek-v4-pro",
+      aiThreatThreshold: 3,
+      aiTriggerOnLeaks: true,
+      aiTriggerOnCritical: true
+    };
+    saveSoarSettings();
+
+    // 6. Broadcast clean state
+    broadcast({ event: "incidents_list", data: [] });
+    broadcast({ event: "logs_list", data: [] });
+    broadcast({ event: "quarantine_updated", data: [] });
+    broadcast({ event: "soar_settings_updated", data: soarSettings });
+    broadcast({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } });
+
+    addLog("server", "info", "Demo and SOAR state has been completely reset by administrator");
+
+    res.json({ success: true });
+  } catch (e) {
+    logger.error("Failed to reset demo data", { err: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── AI ───────────────────────────────────────────────────────────────────────
 app.post("/api/ai/task", async (req, res) => {
   const { model, task, systemPrompt, incidentId } = req.body;

@@ -308,6 +308,14 @@ function cleanupOld(days = 90) {
 
 setInterval(() => cleanupOld(30), 24 * 60 * 60 * 1000);
 
+function resetDemoData() {
+  db.prepare('DELETE FROM incidents').run();
+  db.prepare('DELETE FROM logs').run();
+  db.prepare('DELETE FROM cve_logs').run();
+  db.prepare('DELETE FROM bot_logs').run();
+  db.prepare('DELETE FROM quarantine').run();
+}
+
 module.exports = {
   addIncident, getIncidents, updateIncident,
   addLog, getLogs, countLogs,
@@ -316,5 +324,7 @@ module.exports = {
   getStats, cleanupOld,
   verifyUser, addUser, getAllUsers,
   getUserByChatId, updateUserChatId, getAllChatIds,
-  addQuarantine, removeQuarantine, getQuarantinedIps
+  addQuarantine, removeQuarantine, getQuarantinedIps,
+  resetDemoData
 };
+
