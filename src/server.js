@@ -242,6 +242,9 @@ function extractIpFromIncident(description, details) {
   if (details) {
     if (details.sourceIp) return details.sourceIp;
     if (details.ip) return details.ip;
+    if (details.ddos && details.ddos.top_ips && Array.isArray(details.ddos.top_ips) && details.ddos.top_ips.length > 0) {
+      return details.ddos.top_ips[0].ip;
+    }
   }
   const desc = description || "";
   const ipMatch = desc.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
