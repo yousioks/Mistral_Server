@@ -24,6 +24,7 @@ function initSchema() {
       details TEXT,
       status TEXT DEFAULT 'new',
       comment TEXT,
+      geo TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -88,6 +89,9 @@ initSchema();
 ['chat_id TEXT', 'nickname TEXT', 'role TEXT DEFAULT \'operator\''].forEach(col => {
   try { db.exec(`ALTER TABLE users ADD COLUMN ${col}`); } catch (_) {}
 });
+['geo TEXT'].forEach(col => {
+  try { db.exec(`ALTER TABLE incidents ADD COLUMN ${col}`); } catch (_) {}
+});
 
 // Дефолтный admin если таблица пустая
 const adminExists = db.prepare('SELECT count(*) as count FROM users').get();
@@ -143,8 +147,8 @@ function getAllChatIds() {
 // --- Incidents ---
 function addIncident(incident) {
   db.prepare(`
-    INSERT INTO incidents (id, timestamp, severity, monitor, type, description, details, status)
-    VALUES (@id, @timestamp, @severity, @monitor, @type, @description, @details, @status)
+    INSERT INTO incidents (id, timestamp, severity, monitor, type, description, details, status, geo)
+    VALUES (@id, @timestamp, @severity, @monitor, @type, @description, @details, @status, @geo)
   `).run({
     id: incident.id || uuidv4(),
     timestamp: incident.timestamp || new Date().toISOString(),
@@ -154,6 +158,7 @@ function addIncident(incident) {
     description: incident.description,
     details: JSON.stringify(incident.details || {}),
     status: incident.status || 'new',
+    geo: incident.geo ? JSON.stringify(incident.geo) : null,
   });
   return incident;
 }
@@ -167,12 +172,13 @@ function getIncidents({ severity, limit = 100, offset = 0 } = {}) {
   return db.prepare(sql).all(...params);
 }
 
-function updateIncident(id, { status, comment, severity }) {
+function updateIncident(id, { status, comment, severity, geo }) {
   const sets = [];
   const params = [];
   if (status) { sets.push('status = ?'); params.push(status); }
   if (comment !== undefined) { sets.push('comment = ?'); params.push(comment); }
   if (severity) { sets.push('severity = ?'); params.push(severity); }
+  if (geo !== undefined) { sets.push('geo = ?'); params.push(geo ? JSON.stringify(geo) : null); }
   if (sets.length === 0) return;
   params.push(id);
   db.prepare(`UPDATE incidents SET ${sets.join(', ')} WHERE id = ?`).run(...params);

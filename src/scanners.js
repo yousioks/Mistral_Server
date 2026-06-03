@@ -7,17 +7,13 @@ function runSemgrep(targetDir, rules = 'p/security-audit') {
   try {
     execSync('semgrep --version', { timeout: 5000, stdio: 'ignore' });
   } catch (e) {
-    // Generate mock data for demonstration if tool is missing
     return { 
       scanner: 'semgrep', 
       target: targetDir, 
       timestamp: new Date().toISOString(),
-      findings: [
-        { path: 'src/api/auth.js', line: 42, message: 'Hardcoded credentials found', severity: 'CRITICAL', rule: 'hardcoded-secrets' },
-        { path: 'src/utils/db.js', line: 15, message: 'Potential SQL Injection vulnerability', severity: 'HIGH', rule: 'sql-injection' }
-      ],
+      findings: [],
       errors: [],
-      mock: true
+      error: 'Semgrep is not installed or not in PATH. Please run install_semgrep_trivy.sh on the server to install it.'
     };
   }
   const outFile = path.join(__dirname, '..', 'logs', `semgrep-${Date.now()}.json`);
@@ -44,17 +40,13 @@ function runTrivy(target, scanType = 'fs') {
   try {
     execSync('trivy version', { timeout: 5000, stdio: 'ignore' });
   } catch (e) {
-    // Generate mock data for demonstration if tool is missing
     return { 
       scanner: 'trivy', 
       target, 
       scanType,
       timestamp: new Date().toISOString(),
-      findings: [
-        { target: 'package.json', pkg: 'lodash', vulnId: 'CVE-2021-41556', severity: 'HIGH', title: 'Regular Expression Denial of Service (ReDoS)', fixedVersion: '4.17.21' },
-        { target: 'Dockerfile', pkg: 'openssl', vulnId: 'CVE-2022-0778', severity: 'CRITICAL', title: 'Infinite loop in BN_mod_sqrt() reachable when parsing certificates', fixedVersion: '1.1.1n' }
-      ],
-      mock: true
+      findings: [],
+      error: 'Trivy is not installed or not in PATH. Please run install_semgrep_trivy.sh on the server to install it.'
     };
   }
   const outFile = path.join(__dirname, '..', 'logs', `trivy-${Date.now()}.json`);

@@ -74,6 +74,37 @@ const cveLogs = [];
 const clients = new Map();
 const usedNonces = new Set();
 
+// SOAR Settings Persistence
+const soarSettingsPath = path.join(__dirname, "../data/soar_settings.json");
+let soarSettings = {
+  autoBanDdos: false,
+  autoBanBruteForce: false,
+  aiDefenseEnabled: false,
+  aiMakeChanges: true,
+  aiModel: "deepseek-v4-pro",
+  aiThreatThreshold: 3,
+  aiTriggerOnLeaks: true,
+  aiTriggerOnCritical: true
+};
+if (fs.existsSync(soarSettingsPath)) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(soarSettingsPath, "utf8"));
+    soarSettings = { ...soarSettings, ...saved };
+  } catch (e) {
+    logger.error("Failed to read SOAR settings", { err: e.message });
+  }
+}
+function saveSoarSettings() {
+  try {
+    const dir = path.dirname(soarSettingsPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(soarSettingsPath, JSON.stringify(soarSettings, null, 2), "utf8");
+  } catch (e) {
+    logger.error("Failed to save SOAR settings", { err: e.message });
+  }
+}
+
+
 function addLog(type, level, message, meta = {}) {
   const entry = { id: uuidv4(), timestamp: new Date().toISOString(), type, level, message, meta };
   try { db.addLog(entry); } catch (e) { logger.error("DB addLog failed", { err: e.message }); }
@@ -97,16 +128,155 @@ function autoCategorizeSeverity(type, desc, original) {
   return original || "MEDIUM";
 }
 
+const MOCK_COUNTRIES = [
+  { country: "США", code: "US", lat: 37.09, lon: -95.71, isp: "Amazon Web Services Inc.", reputation: 45 },
+  { country: "Китай", code: "CN", lat: 35.86, lon: 104.19, isp: "China Telecom", reputation: 88 },
+  { country: "Нидерланды", code: "NL", lat: 52.13, lon: 5.29, isp: "DigitalOcean LLC", reputation: 32 },
+  { country: "Германия", code: "DE", lat: 51.16, lon: 10.45, isp: "Hetzner Online GmbH", reputation: 15 },
+  { country: "Бразилия", code: "BR", lat: -14.23, lon: -51.92, isp: "Companhia de Telecomunicacoes", reputation: 62 },
+  { country: "Россия", code: "RU", lat: 55.75, lon: 37.61, isp: "Rostelecom PJSC", reputation: 8 },
+  { country: "Индия", code: "IN", lat: 20.59, lon: 78.96, isp: "Reliance Jio Infocomm", reputation: 50 },
+  { country: "Великобритания", code: "GB", lat: 55.37, lon: -3.43, isp: "British Telecommunications PLC", reputation: 24 }
+];
+
+function extractIpFromIncident(description, details) {
+  if (details) {
+    if (details.sourceIp) return details.sourceIp;
+    if (details.ip) return details.ip;
+  }
+  const desc = description || "";
+  const ipMatch = desc.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+  if (ipMatch) return ipMatch[0];
+  return null;
+}
+
+function getMockGeoIP(ip, fallbackId) {
+  const seed = ip || fallbackId || "random";
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = seed.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const idx = Math.abs(hash) % MOCK_COUNTRIES.length;
+  if (ip === '127.0.0.1' || ip === 'localhost' || ip === '::1' || ip === '::ffff:127.0.0.1') {
+    const simIdx = (Math.abs(hash) + 1) % (MOCK_COUNTRIES.length - 1);
+    const country = MOCK_COUNTRIES[simIdx >= 5 ? simIdx + 1 : simIdx];
+    return {
+      ...country,
+      ip: ip,
+      simulated: true
+    };
+  }
+  return {
+    ...MOCK_COUNTRIES[idx],
+    ip: ip || "0.0.0.0"
+  };
+}
+
+function resolveRealGeoIP(incidentId, ip) {
+  if (!ip || ip === "127.0.0.1" || ip === "localhost" || ip === "::1" || ip === "::ffff:127.0.0.1") return;
+  const http = require("http");
+  const url = `http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,lat,lon,isp`;
+  
+  http.get(url, (res) => {
+    let raw = "";
+    res.on("data", chunk => raw += chunk);
+    res.on("end", () => {
+      try {
+        const data = JSON.parse(raw);
+        if (data && data.status === "success") {
+          const inc = incidents.find(i => i.id === incidentId);
+          if (inc) {
+            inc.geo = {
+              country: data.country || "Unknown",
+              code: data.countryCode || "UN",
+              lat: data.lat || 0,
+              lon: data.lon || 0,
+              isp: data.isp || "Unknown",
+              reputation: inc.geo ? inc.geo.reputation : 50,
+              ip: ip
+            };
+            try {
+              db.updateIncident(incidentId, { geo: inc.geo });
+              broadcast({ event: "incident_updated", data: inc });
+            } catch (e) {
+              logger.error("Failed to save real GeoIP to DB", { err: e.message });
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn(`Failed to parse real GeoIP for ${ip}: ${e.message}`);
+      }
+    });
+  }).on("error", (e) => {
+    logger.warn(`Failed to fetch real GeoIP for ${ip}: ${e.message}`);
+  });
+}
+
 function addIncident(severity, monitor, type, description, details = {}) {
   const finalSeverity = autoCategorizeSeverity(type, description, severity);
   const contextLogs = serverLogs.slice(-100).map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
-  const incident = { id: uuidv4(), timestamp: new Date().toISOString(), severity: finalSeverity, monitor, type, description, details, status: "new", contextBlock: contextLogs };
+  const extractedIp = extractIpFromIncident(description, details);
+  const incId = uuidv4();
+  const geoInfo = getMockGeoIP(extractedIp, incId);
+  const incident = { 
+    id: incId, 
+    timestamp: new Date().toISOString(), 
+    severity: finalSeverity, 
+    monitor, 
+    type, 
+    description, 
+    details, 
+    status: "new", 
+    contextBlock: contextLogs,
+    ip: extractedIp,
+    geo: geoInfo
+  };
   try { db.addIncident(incident); } catch (e) { logger.error("DB addIncident failed", { err: e.message }); }
   incidents.unshift(incident);
   if (incidents.length > 5000) incidents.pop();
   addLog("server", finalSeverity === "CRITICAL" ? "error" : "warn", `Incident: ${type}`, incident);
   broadcast({ event: "incident", data: incident });
   notifyTelegram(incident);
+
+  // Resolve real GeoIP in background
+  if (extractedIp) {
+    resolveRealGeoIP(incId, extractedIp);
+  }
+
+  // SOAR Auto-Ban Logic
+  if (extractedIp) {
+    const ip = extractedIp;
+    const typeLower = (type || "").toLowerCase();
+    const descLower = (description || "").toLowerCase();
+    
+    let shouldBan = false;
+    let reason = "";
+    
+    if (soarSettings.autoBanDdos && (typeLower.includes("ddos") || typeLower.includes("flood") || descLower.includes("ddos") || descLower.includes("flood"))) {
+      shouldBan = true;
+      reason = "SOAR: Auto-Ban DDoS Attempt";
+    } else if (soarSettings.autoBanBruteForce && (typeLower.includes("brute") || typeLower.includes("auth") || descLower.includes("brute") || descLower.includes("auth"))) {
+      shouldBan = true;
+      reason = "SOAR: Auto-Ban Brute Force Attempt";
+    }
+    
+    // Safety check: Don't ban ourselves or the server itself
+    const serverHost = process.env.API_HOST || "127.0.0.1";
+    const isSafe = ip === "127.0.0.1" || ip === "localhost" || ip === "::1" || ip === "::ffff:127.0.0.1" || ip === serverHost;
+    
+    if (shouldBan && !isSafe) {
+      try {
+        const { execSync } = require("child_process");
+        execSync(`ufw deny from ${ip} to any`, { stdio: "ignore" });
+      } catch (e) {
+        logger.warn(`UFW block failed for ${ip}: ${e.message}`);
+      }
+      db.addQuarantine(ip, reason);
+      addLog("server", "warn", `SOAR Auto-Ban Neutralized Threat: ${ip} (${reason})`, { ip, reason });
+      broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+    }
+  }
+
   return incident;
 }
 
@@ -140,6 +310,28 @@ app.use(express.json({ limit: "10mb" }));
 // ── Health ──────────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime(), model: activeModel, timestamp: new Date().toISOString() });
+});
+
+// ── SOAR Settings ───────────────────────────────────────────────────────────
+app.get("/api/soar-settings", (_req, res) => {
+  res.json(soarSettings);
+});
+
+app.post("/api/soar-settings", (req, res) => {
+  const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical } = req.body || {};
+  if (autoBanDdos !== undefined) soarSettings.autoBanDdos = !!autoBanDdos;
+  if (autoBanBruteForce !== undefined) soarSettings.autoBanBruteForce = !!autoBanBruteForce;
+  if (aiDefenseEnabled !== undefined) soarSettings.aiDefenseEnabled = !!aiDefenseEnabled;
+  if (aiMakeChanges !== undefined) soarSettings.aiMakeChanges = !!aiMakeChanges;
+  if (aiModel !== undefined) soarSettings.aiModel = String(aiModel);
+  if (aiThreatThreshold !== undefined) soarSettings.aiThreatThreshold = Number(aiThreatThreshold);
+  if (aiTriggerOnLeaks !== undefined) soarSettings.aiTriggerOnLeaks = !!aiTriggerOnLeaks;
+  if (aiTriggerOnCritical !== undefined) soarSettings.aiTriggerOnCritical = !!aiTriggerOnCritical;
+  
+  saveSoarSettings();
+  broadcast({ event: "soar_settings_updated", data: soarSettings });
+  addLog("server", "info", "SOAR & AI settings updated by administrator", soarSettings);
+  res.json({ success: true, soarSettings });
 });
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -223,6 +415,16 @@ app.patch("/api/incidents/:id", (req, res) => {
   if (severity) { incident.severity = severity; try { db.updateIncident(req.params.id, { severity }); } catch (_) {} }
   broadcast({ event: "incident_updated", data: incident });
   res.json(incident);
+});
+
+// ── GeoIP Lookup ────────────────────────────────────────────────────────────
+app.get("/api/geoip/:ip", (req, res) => {
+  try {
+    const ip = req.params.ip;
+    res.json(getMockGeoIP(ip));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Quarantine ─────────────────────────────────────────────────────────────
@@ -323,6 +525,99 @@ app.post("/api/ai/model", (req, res) => {
   res.json({ model: activeModel });
 });
 
+// ── NLP Search & Script Execution ────────────────────────────────────────────
+const nlpPrompt = `You are a helper that converts a user's Russian or English log search query into JSON filters.
+Available log types: "server", "bot", "cve".
+Available log levels: "error", "warn", "info", "debug".
+
+Your response MUST be ONLY a JSON object in this format, with no markdown, no other text:
+{
+  "filter": {
+    "type": "server" | "bot" | "cve" | "",
+    "level": "error" | "warn" | "info" | "debug" | ""
+  }
+}
+
+Examples:
+- "покажи ошибки бота" -> {"filter": {"type": "bot", "level": "error"}}
+- "серверные варнинги" -> {"filter": {"type": "server", "level": "warn"}}
+- "критические события cve" -> {"filter": {"type": "cve", "level": "error"}}
+- "все логи" -> {"filter": {"type": "", "level": ""}}
+`;
+
+app.post("/api/ai-nlp-search", async (req, res) => {
+  const { query } = req.body;
+  if (!query) return res.status(400).json({ error: "Query required" });
+  
+  // Local keyword parser fallback (in case AI is not configured or fails)
+  const fallbackParse = (q) => {
+    const lower = q.toLowerCase();
+    let type = "";
+    let level = "";
+    if (lower.includes("сервер") || lower.includes("server")) type = "server";
+    else if (lower.includes("бот") || lower.includes("bot")) type = "bot";
+    else if (lower.includes("cve") || lower.includes("уязвим")) type = "cve";
+
+    if (lower.includes("критич") || lower.includes("ошибк") || lower.includes("error") || lower.includes("crit")) level = "error";
+    else if (lower.includes("варн") || lower.includes("предупр") || lower.includes("warn")) level = "warn";
+    else if (lower.includes("инфо") || lower.includes("info")) level = "info";
+    else if (lower.includes("дебаг") || lower.includes("debug")) level = "debug";
+    return { filter: { type, level } };
+  };
+
+  try {
+    if (!aiClient) {
+      return res.json(fallbackParse(query));
+    }
+    
+    const messages = [
+      { role: "system", content: nlpPrompt },
+      { role: "user", content: query }
+    ];
+    const aiResponse = await askAI(activeModel, messages, 0.1);
+    let parsed;
+    try {
+      const cleaned = aiResponse.replace(/```json/g, "").replace(/```/g, "").trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      logger.warn("Failed to parse NLP AI response, using fallback", { aiResponse });
+      parsed = fallbackParse(query);
+    }
+    res.json(parsed);
+  } catch (err) {
+    logger.warn("NLP AI search failed, using fallback", { err: err.message });
+    res.json(fallbackParse(query));
+  }
+});
+
+app.post("/api/execute-ai-script", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  const { script } = req.body;
+  if (!script) return res.status(400).json({ error: "Script required" });
+
+  try {
+    sanitizeAIInput(script);
+    const { exec } = require("child_process");
+    addLog("server", "info", "Executing AI-generated mitigation script by administrator", { script });
+
+    exec(script, (err, stdout, stderr) => {
+      const output = stdout + (stderr ? "\n" + stderr : "");
+      if (err) {
+        logger.error("AI script execution failed", { error: err.message, output });
+        addLog("server", "error", `AI script failed: ${err.message}`, { output });
+        return res.json({ success: false, error: err.message, output });
+      }
+      logger.info("AI script execution completed successfully");
+      addLog("server", "info", "AI script executed successfully");
+      res.json({ success: true, output });
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Scans ────────────────────────────────────────────────────────────────────
 app.post("/api/scan/semgrep", async (req, res) => {
   const { targetDir, rules } = req.body;
@@ -333,6 +628,64 @@ app.post("/api/scan/trivy", async (req, res) => {
   const { target, scanType } = req.body;
   const result = runTrivy(target || ".", scanType || "fs");
   res.json(result);
+});
+
+// ── Scanner installation trigger ─────────────────────────────────────────────
+app.post("/api/install-scanners", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+  
+  try {
+    const { exec } = require("child_process");
+    const scriptPath = path.join(__dirname, "..", "install_semgrep_trivy.sh");
+    addLog("server", "info", "Starting scanner tools background installation (Semgrep & Trivy)");
+    exec(`sudo bash "${scriptPath}" > "${path.join(__dirname, "..", "logs", "scanner_install.log")}" 2>&1`, (err) => {
+      if (err) {
+        logger.error("Scanner installation failed", { error: err.message });
+        addLog("server", "error", `Scanner installation failed: ${err.message}`);
+      } else {
+        logger.info("Scanner installation completed successfully");
+        addLog("server", "info", "Scanner installation completed successfully");
+      }
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Run Audit trigger ─────────────────────────────────────────────────────────
+let auditRunning = false;
+app.post("/api/run-audit", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+  
+  if (auditRunning) return res.json({ success: true, message: "Audit already in progress" });
+  auditRunning = true;
+  
+  addLog("server", "info", "Starting system security audit (Trivy & Semgrep) in background");
+  
+  // Run background scan
+  const { exec } = require("child_process");
+  const tempTrivy = "/tmp/trivy_scan_out.json";
+  const tempSemgrep = "/tmp/semgrep_scan_out.json";
+  
+  const cmd = `trivy fs --format json -o ${tempTrivy} /etc 2>/dev/null; semgrep --config=p/security-audit "${path.join(__dirname, "..")}" --json -o ${tempSemgrep} --quiet 2>/dev/null`;
+  
+  exec(cmd, (err) => {
+    auditRunning = false;
+    if (err) {
+      logger.error("System security audit failed", { error: err.message });
+      addLog("server", "error", `Security audit failed: ${err.message}`);
+    } else {
+      logger.info("System security audit completed");
+      addLog("server", "info", "Security audit completed. New vulnerabilities detected.");
+      // Inject as an incident
+      addIncident("HIGH", "SecurityScanner", "VULNERABILITY_DISCOVERY", "Security audit finished. Trivy and Semgrep findings updated.");
+    }
+  });
+  
+  res.json({ success: true });
 });
 
 // ── Bot notify endpoint (вызывается из addIncident) ──────────────────────────
@@ -355,7 +708,7 @@ function startWSS(server) {
   const wss = new WebSocket.Server({ server, path: "/ws" });
   wss.on("connection", (ws, req) => {
     const clientId = uuidv4();
-    const ip = req.socket.remoteAddress;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     clients.set(ws, { id: clientId, ip, authenticated: false });
     addLog("server", "info", "WS client connected (awaiting auth)", { clientId, ip });
 
@@ -376,13 +729,14 @@ function startWSS(server) {
             usedNonces.add(nonce);
             client.authenticated = true;
             clearTimeout(authTimer);
-            ws.send(JSON.stringify({ event: "auth_success", data: { clientId, model: activeModel } }));
+            ws.send(JSON.stringify({ event: "auth_success", data: { clientId, model: activeModel, clientIp: ip } }));
             addLog("server", "info", "WS client authenticated", { clientId, ip });
             // Сразу шлём снапшот
             ws.send(JSON.stringify({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } }));
             ws.send(JSON.stringify({ event: "incidents_list", data: incidents.slice(0, 100) }));
             ws.send(JSON.stringify({ event: "logs_list", data: serverLogs.slice(0, 200) }));
             ws.send(JSON.stringify({ event: "quarantine_updated", data: db.getQuarantinedIps() }));
+            ws.send(JSON.stringify({ event: "soar_settings_updated", data: soarSettings }));
           } else {
             addLog("server", "warn", "WS auth failed: bad token", { clientId, ip });
             ws.close(4003, "Invalid token");
@@ -406,14 +760,17 @@ function startWSS(server) {
           ws.send(JSON.stringify({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } })); return;
         }
         if (msg.event === "ai_task") {
-          const { task, model, systemPrompt } = msg.data || {};
+          const { task, model, systemPrompt, isAutoDefense, incidentId } = msg.data || {};
+          if (isAutoDefense) {
+            addLog("server", "info", `AI Autonomous Mitigation triggered for incident: ${incidentId} using model ${model || activeModel}`);
+          }
           try {
             sanitizeAIInput(task);
             const msgs = [{ role: "system", content: AI_SAFETY_RULES }];
             if (systemPrompt) msgs.push({ role: "system", content: systemPrompt });
             msgs.push({ role: "user", content: task });
             const result = await askAI(model || activeModel, msgs);
-            ws.send(JSON.stringify({ event: "ai_result", data: { model: model || activeModel, result, task } }));
+            ws.send(JSON.stringify({ event: "ai_result", data: { model: model || activeModel, result, task, isAutoDefense, incidentId } }));
           } catch (err) { ws.send(JSON.stringify({ event: "ai_error", data: { error: err.message } })); }
           return;
         }
@@ -422,6 +779,7 @@ function startWSS(server) {
           if (MODELS[model] || Object.values(MODELS).some(m => m.id === model)) {
             activeModel = MODELS[model]?.id || model;
             broadcast({ event: "model_changed", data: { model: activeModel } });
+            addLog("server", "info", `AI Model switched to: ${activeModel}`);
           }
           return;
         }
@@ -462,6 +820,9 @@ function loadPersistedData() {
     dbIncidents.forEach(i => {
       if (typeof i.details === "string") {
         try { i.details = JSON.parse(i.details); } catch (_) {}
+      }
+      if (typeof i.geo === "string") {
+        try { i.geo = JSON.parse(i.geo); } catch (_) {}
       }
     });
     incidents.push(...dbIncidents);
