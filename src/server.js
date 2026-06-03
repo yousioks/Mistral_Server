@@ -1050,7 +1050,8 @@ function startWSS(server) {
         if (msg.event === "get_logs") {
           const { type = "server", limit = 200 } = msg.data || {};
           const data = type === "bot" ? botLogs : type === "cve" ? cveLogs : serverLogs;
-          ws.send(JSON.stringify({ event: "logs_list", data: data.slice(0, limit) })); return;
+          const sliced = data.slice(-limit).reverse();
+          ws.send(JSON.stringify({ event: "logs_list", data: sliced })); return;
         }
         if (msg.event === "get_stats") {
           ws.send(JSON.stringify({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } })); return;
