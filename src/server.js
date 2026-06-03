@@ -420,6 +420,9 @@ app.get("/api/soar-settings", (_req, res) => {
 });
 
 app.post("/api/soar-settings", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
   const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical } = req.body || {};
   if (autoBanDdos !== undefined) soarSettings.autoBanDdos = !!autoBanDdos;
   if (autoBanBruteForce !== undefined) soarSettings.autoBanBruteForce = !!autoBanBruteForce;
