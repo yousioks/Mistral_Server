@@ -125,7 +125,7 @@ function get_ddos_indicators(conns)
         table.insert(top_ips, {ip = ip, count = count})
     end
     table.sort(top_ips, function(a,b) return a.count > b.count end)
-    while #top_ips > 5 do table.remove(top_ips) end
+    while #top_ips > 50 do table.remove(top_ips) end
     return {syn_recv = syn_recv, established = established, top_ips = top_ips}
 end
 
