@@ -516,6 +516,22 @@ app.patch("/api/incidents/:id", (req, res) => {
   res.json(incident);
 });
 
+app.delete("/api/incidents", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    db.clearIncidents();
+    incidents.length = 0;
+    broadcast({ event: "incidents_list", data: [] });
+    addLog("server", "info", "Incident history has been cleared by administrator");
+    res.json({ success: true });
+  } catch (e) {
+    logger.error("Failed to clear incidents", { err: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GeoIP Lookup ────────────────────────────────────────────────────────────
 app.get("/api/geoip/:ip", (req, res) => {
   try {

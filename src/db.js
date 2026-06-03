@@ -316,6 +316,10 @@ function resetDemoData() {
   db.prepare('DELETE FROM quarantine').run();
 }
 
+function clearIncidents() {
+  db.prepare('DELETE FROM incidents').run();
+}
+
 module.exports = {
   addIncident, getIncidents, updateIncident,
   addLog, getLogs, countLogs,
@@ -325,6 +329,7 @@ module.exports = {
   verifyUser, addUser, getAllUsers,
   getUserByChatId, updateUserChatId, getAllChatIds,
   addQuarantine, removeQuarantine, getQuarantinedIps,
-  resetDemoData
+  resetDemoData,
+  clearIncidents
 };
 
