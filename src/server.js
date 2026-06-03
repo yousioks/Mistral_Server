@@ -104,6 +104,105 @@ function saveSoarSettings() {
   }
 }
 
+const vulnerabilitiesDir = path.join(__dirname, "../data/vulnerabilities");
+if (!fs.existsSync(vulnerabilitiesDir)) fs.mkdirSync(vulnerabilitiesDir, { recursive: true });
+
+function getVulnerabilitiesFromDisk() {
+  const list = [];
+  try {
+    if (fs.existsSync(vulnerabilitiesDir)) {
+      const files = fs.readdirSync(vulnerabilitiesDir);
+      for (const file of files) {
+        if (file.endsWith(".json")) {
+          try {
+            const content = JSON.parse(fs.readFileSync(path.join(vulnerabilitiesDir, file), "utf8"));
+            list.push(content);
+          } catch (e) {
+            logger.error(`Error reading vulnerability file ${file}`, { err: e.message });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    logger.error("Error reading vulnerabilities directory", { err: e.message });
+  }
+  return list;
+}
+
+function ensureDefaultVulnerabilities() {
+  try {
+    const list = getVulnerabilitiesFromDisk();
+    if (list.length === 0) {
+      const defaults = [
+        {
+          id: "sql_injection",
+          name: "SQL Injection (SQLi)",
+          severity: "HIGH",
+          description: "Exploitation of SQL queries to gain unauthorized database access.",
+          detection_rules: "Check logs for rules/keywords: UNION SELECT, SQLI_AUTH, sql syntax error, OR 1=1.",
+          remediation: "Block attacker IP via UFW firewall. Sanitize incoming inputs, use parameterized queries, block suspicious parameters at WAF level."
+        },
+        {
+          id: "ssh_brute_force",
+          name: "SSH Password Brute Force",
+          severity: "HIGH",
+          description: "Automated attempts to guess passwords on SSH (port 22).",
+          detection_rules: "Check logs for failed login attempts (Failed password for root) and multiple failures followed by a success from the same IP.",
+          remediation: "Block attacker IP via UFW. Disable password authentication for SSH, enforce SSH Key authentication, configure fail2ban."
+        },
+        {
+          id: "honeypot_triggered",
+          name: "Honeypot Decoy Triggered",
+          severity: "CRITICAL",
+          description: "Interaction with decoy resources such as a fake payment gateway (remon_payment_gateway) which only attackers scan or probe.",
+          detection_rules: "Check logs for hits containing 'remon_payment_gateway' and incoming requests on port 8081.",
+          remediation: "Instant quarantine (ufw deny from IP). Immediately notify security operations center (SOC)."
+        },
+        {
+          id: "ransomware_encryption",
+          name: "Ransomware Encryption Active",
+          severity: "CRITICAL",
+          description: "High-speed encryption of files in sensitive system directories accompanied by extreme CPU utilization spikes.",
+          detection_rules: "Mass creation of '.enc' files, high CPU/disk activity (90%+), presence of ransom note files.",
+          remediation: "Kill malicious process by PID immediately, restrict write permissions, isolate host from network, check backups."
+        },
+        {
+          id: "privilege_escalation",
+          name: "Privilege Escalation",
+          severity: "CRITICAL",
+          description: "Attempts to escalate execution privileges to root (UID 0) using exploits (e.g. DirtyPipe) or misconfigured sudoers.",
+          detection_rules: "Log entries showing unauthorized modification of /etc/shadow or /etc/passwd, execution of abnormal su/sudo commands.",
+          remediation: "Kill process, inspect kernel exploit vectors, review /etc/shadow integrity, check persistent crontabs."
+        },
+        {
+          id: "ddos_flood",
+          name: "DDoS Network Flood",
+          severity: "HIGH",
+          description: "Volumetric denial of service (SYN Flood, HTTP Flood) aimed at exhausting network resources.",
+          detection_rules: "Huge spike in active connections (ss -tlnp / metrics), network drop log entries, high system load.",
+          remediation: "Enable SYN cookies, configure UFW rate limiting, route traffic through reverse proxy/WAF."
+        },
+        {
+          id: "port_scan",
+          name: "Port Scanning / Discovery",
+          severity: "LOW",
+          description: "Network discovery scanning (Nmap scan) to identify active services and ports.",
+          detection_rules: "Port scans detected from firewall or network monitor logs checking sequential ports.",
+          remediation: "Log scan event, check exposed services, disable unused ports, monitor subsequent actions from scanner IP."
+        }
+      ];
+      defaults.forEach(v => {
+        fs.writeFileSync(path.join(vulnerabilitiesDir, `${v.id}.json`), JSON.stringify(v, null, 2), "utf8");
+      });
+      logger.info("Initialized default vulnerability database files on disk.");
+    }
+  } catch (e) {
+    logger.error("Failed to ensure default vulnerabilities", { err: e.message });
+  }
+}
+ensureDefaultVulnerabilities();
+
+
 
 function addLog(type, level, message, meta = {}) {
   const entry = { id: uuidv4(), timestamp: new Date().toISOString(), type, level, message, meta };
@@ -502,18 +601,124 @@ app.get("/api/stats", (_req, res) => {
   catch (e) { res.json({ incidents: {}, logs: {}, connectedClients: clients.size }); }
 });
 
+// ── Vulnerability Database ──────────────────────────────────────────────────
+app.get("/api/vulnerabilities", (_req, res) => {
+  try {
+    res.json(getVulnerabilitiesFromDisk());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/vulnerabilities", (req, res) => {
+  const { id, name, severity, description, detection_rules, remediation } = req.body || {};
+  if (!id || !name) return res.status(400).json({ error: "id and name are required" });
+  
+  try {
+    const filename = `${id.toLowerCase().replace(/[^a-z0-9_-]/g, "")}.json`;
+    const data = { id, name, severity: severity || "MEDIUM", description: description || "", detection_rules: detection_rules || "", remediation: remediation || "" };
+    fs.writeFileSync(path.join(vulnerabilitiesDir, filename), JSON.stringify(data, null, 2), "utf8");
+    addLog("server", "info", `Vulnerability DB updated: ${name} (${id})`);
+    res.json({ success: true, vulnerability: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/vulnerabilities/:id", (req, res) => {
+  const id = req.params.id;
+  try {
+    const filename = `${id.toLowerCase().replace(/[^a-z0-9_-]/g, "")}.json`;
+    const filepath = path.join(vulnerabilitiesDir, filename);
+    if (fs.existsSync(filepath)) {
+      fs.unlinkSync(filepath);
+      addLog("server", "info", `Vulnerability DB deleted: ${id}`);
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Vulnerability not found" });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── AI Reports ──────────────────────────────────────────────────────────────
+const reportsDir = path.join(__dirname, "../data/reports");
+if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
+
+app.get("/api/ai-reports", (_req, res) => {
+  try {
+    const list = [];
+    if (fs.existsSync(reportsDir)) {
+      const files = fs.readdirSync(reportsDir);
+      for (const file of files) {
+        if (file.endsWith(".md")) {
+          const filepath = path.join(reportsDir, file);
+          const stats = fs.statSync(filepath);
+          let incidentId = "";
+          let taskId = "";
+          if (file.startsWith("report-task-")) {
+            taskId = file.substring(12, file.length - 3);
+          } else if (file.startsWith("report-")) {
+            incidentId = file.substring(7, file.length - 3);
+          }
+          list.push({
+            filename: file,
+            incidentId,
+            taskId,
+            createdAt: stats.birthtime || stats.mtime,
+            size: stats.size
+          });
+        }
+      }
+    }
+    list.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json(list);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/ai-reports/:id", (req, res) => {
+  const id = req.params.id;
+  try {
+    let filepath = path.join(reportsDir, `report-${id}.md`);
+    if (!fs.existsSync(filepath)) {
+      filepath = path.join(reportsDir, `report-task-${id}.md`);
+    }
+    if (fs.existsSync(filepath)) {
+      const markdown = fs.readFileSync(filepath, "utf8");
+      res.json({ markdown });
+    } else {
+      res.status(404).json({ error: "Report not found" });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── AI ───────────────────────────────────────────────────────────────────────
 app.post("/api/ai/task", async (req, res) => {
-  const { model, task, systemPrompt } = req.body;
+  const { model, task, systemPrompt, incidentId } = req.body;
   const apiKey = req.headers["x-api-key"];
   const isLocal = req.ip === "::1" || req.ip === "127.0.0.1" || req.ip === "::ffff:127.0.0.1";
   if (apiKey !== WSS_SECRET_TOKEN && !isLocal) return res.status(403).json({ error: "Unauthorized" });
   try {
     sanitizeAIInput(task);
-    const msgs = [{ role: "system", content: AI_SAFETY_RULES }];
+    
+    // Inject vulnerabilities database
+    const vulns = getVulnerabilitiesFromDisk();
+    const vulnContext = `KNOWN SYSTEM VULNERABILITIES DATABASE:\n` + vulns.map(v => `- [${v.id}] ${v.name} (${v.severity}): ${v.description}\n  Rules: ${v.detection_rules}\n  Mitigation: ${v.remediation}`).join("\n\n");
+    
+    const msgs = [{ role: "system", content: AI_SAFETY_RULES + "\n\n" + vulnContext }];
     if (systemPrompt) msgs.push({ role: "system", content: systemPrompt });
     msgs.push({ role: "user", content: task });
     const result = await askAI(model || activeModel, msgs);
+    
+    // Save report to disk
+    const reportFilename = incidentId ? `report-${incidentId}.md` : `report-task-${uuidv4()}.md`;
+    fs.writeFileSync(path.join(reportsDir, reportFilename), result, "utf8");
+    
     res.json({ model: model || activeModel, result });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -766,10 +971,20 @@ function startWSS(server) {
           }
           try {
             sanitizeAIInput(task);
-            const msgs = [{ role: "system", content: AI_SAFETY_RULES }];
+            
+            // Inject vulnerabilities database
+            const vulns = getVulnerabilitiesFromDisk();
+            const vulnContext = `KNOWN SYSTEM VULNERABILITIES DATABASE:\n` + vulns.map(v => `- [${v.id}] ${v.name} (${v.severity}): ${v.description}\n  Rules: ${v.detection_rules}\n  Mitigation: ${v.remediation}`).join("\n\n");
+            
+            const msgs = [{ role: "system", content: AI_SAFETY_RULES + "\n\n" + vulnContext }];
             if (systemPrompt) msgs.push({ role: "system", content: systemPrompt });
             msgs.push({ role: "user", content: task });
             const result = await askAI(model || activeModel, msgs);
+            
+            // Save report to disk
+            const reportFilename = incidentId ? `report-${incidentId}.md` : `report-task-${uuidv4()}.md`;
+            fs.writeFileSync(path.join(reportsDir, reportFilename), result, "utf8");
+            
             ws.send(JSON.stringify({ event: "ai_result", data: { model: model || activeModel, result, task, isAutoDefense, incidentId } }));
           } catch (err) { ws.send(JSON.stringify({ event: "ai_error", data: { error: err.message } })); }
           return;
