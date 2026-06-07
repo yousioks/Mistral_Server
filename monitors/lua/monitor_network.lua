@@ -153,7 +153,7 @@ function get_ddos_indicators(conns)
     for _, c in ipairs(conns) do
         if c.state == "SYN-RECV" then syn_recv = syn_recv + 1 end
         if c.state == "ESTAB" then established = established + 1 end
-        local ip = c.remote:match("^%[(.+)%]:%d+$") or c.remote:match("^([^:]+)")
+        local ip = c.remote:match("^%[(.-)%]") or c.remote:match("^(.+):[^:]+$") or c.remote:match("^([^:]+)")
         if ip then ip = ip:gsub("^::ffff:", "") end
         if ip and ip ~= "0.0.0.0" and ip ~= "::" then
             local info = ip_counts[ip]
