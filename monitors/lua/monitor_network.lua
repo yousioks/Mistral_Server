@@ -11,7 +11,45 @@ local HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
 local API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
 local PORT_WHITELIST = {22, 80, 443, 5000, 3000, 5432}
-local PROCESS_WHITELIST = {"nginx", "node", "postgres", "dockerd", "sshd", "systemd"}
+local PROCESS_WHITELIST = {
+    "nginx", "node", "postgres", "dockerd", "sshd", "systemd",
+    "kworker", "kthreadd", "ksoftirqd", "migration", "rcu_", "dbus-daemon",
+    "rsyslog", "cron", "udev", "resolved", "timesyncd", "logind", "journald",
+    "agetty", "login", "bash", "sh", "sudo", "su", "ps", "ss", "grep", "awk",
+    "sed", "lua", "python", "networkmanager", "dhcp", "wpa_supplicant",
+    "fail2ban", "zabbix", "amazon-ssm-agent", "pm2", "npm", "containerd",
+    "runc", "rlog", "monitor_", "gvfs", "colord", "cups", "rpcbind",
+    "snapd", "packagekitd", "unattended-upgrades", "atd", "polkitd",
+    "chrony", "irqbalance", "rngd", "auditd", "haveged", "smartd", "udisks"
+}
+
+-- Load dynamic whitelist from process_whitelist.txt if it exists
+local function load_dynamic_whitelist()
+    local script_dir = "."
+    if arg and arg[0] then
+        script_dir = arg[0]:match("(.+)/[^/]+$") or arg[0]:match("(.+)\\[^\\]+$") or "."
+    end
+    local path = script_dir .. "/process_whitelist.txt"
+    local f = io.open(path, "r")
+    if not f then
+        path = "process_whitelist.txt"
+        f = io.open(path, "r")
+    end
+    if f then
+        print("[Monitor C] Loading custom process whitelist from: " .. path)
+        for line in f:lines() do
+            line = line:gsub("^%s+", ""):gsub("%s+$", "")
+            if line ~= "" and not line:match("^#") then
+                table.insert(PROCESS_WHITELIST, line)
+                print("[Monitor C] Whitelisted pattern: " .. line)
+            end
+        end
+        f:close()
+    else
+        print("[Monitor C] No custom process_whitelist.txt found (optional).")
+    end
+end
+load_dynamic_whitelist()
 
 -- ── Helpers ─────────────────────────────────────────────────────────
 function read_cmd(cmd)
@@ -118,12 +156,32 @@ function get_ddos_indicators(conns)
         local ip = c.remote:match("^%[(.+)%]:%d+$") or c.remote:match("^([^:]+)")
         if ip then ip = ip:gsub("^::ffff:", "") end
         if ip and ip ~= "0.0.0.0" and ip ~= "::" then
-            ip_counts[ip] = (ip_counts[ip] or 0) + 1
+            local info = ip_counts[ip]
+            if not info then
+                info = { count = 0, syn_recv = 0, estab = 0, ports = {} }
+                ip_counts[ip] = info
+            end
+            info.count = info.count + 1
+            if c.state == "SYN-RECV" then info.syn_recv = info.syn_recv + 1 end
+            if c.state == "ESTAB" then info.estab = info.estab + 1 end
+            local port = c.local_:match(":(%d+)$")
+            if port then
+                info.ports[port] = true
+            end
         end
     end
     local top_ips = {}
-    for ip, count in pairs(ip_counts) do
-        table.insert(top_ips, {ip = ip, count = count})
+    for ip, info in pairs(ip_counts) do
+        local ports_list = {}
+        for p, _ in pairs(info.ports) do table.insert(ports_list, p) end
+        table.sort(ports_list, function(a,b) return tonumber(a) < tonumber(b) end)
+        table.insert(top_ips, {
+            ip = ip,
+            count = info.count,
+            syn_recv = info.syn_recv,
+            estab = info.estab,
+            ports = ports_list
+        })
     end
     table.sort(top_ips, function(a,b) return a.count > b.count end)
     while #top_ips > 50 do table.remove(top_ips) end
@@ -169,10 +227,11 @@ function check_anomalies(data)
     end
     for _, ip_info in ipairs(data.ddos.top_ips) do
         if ip_info.count > 200 then
+            local ports_str = #ip_info.ports > 0 and table.concat(ip_info.ports, ", ") or "unknown"
             table.insert(anomalies, {
                 severity = "HIGH",
                 type = "DDOS_IP",
-                description = "DDoS: IP " .. ip_info.ip .. " имеет " .. ip_info.count .. " соединений"
+                description = "DDoS: IP " .. ip_info.ip .. " имеет " .. ip_info.count .. " соединений (SYN_RECV: " .. ip_info.syn_recv .. ", ESTABLISHED: " .. ip_info.estab .. ") на порты: " .. ports_str
             })
         end
     end

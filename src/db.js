@@ -172,13 +172,14 @@ function getIncidents({ severity, limit = 100, offset = 0 } = {}) {
   return db.prepare(sql).all(...params);
 }
 
-function updateIncident(id, { status, comment, severity, geo }) {
+function updateIncident(id, { status, comment, severity, geo, description }) {
   const sets = [];
   const params = [];
   if (status) { sets.push('status = ?'); params.push(status); }
   if (comment !== undefined) { sets.push('comment = ?'); params.push(comment); }
   if (severity) { sets.push('severity = ?'); params.push(severity); }
   if (geo !== undefined) { sets.push('geo = ?'); params.push(geo ? JSON.stringify(geo) : null); }
+  if (description !== undefined) { sets.push('description = ?'); params.push(description); }
   if (sets.length === 0) return;
   params.push(id);
   db.prepare(`UPDATE incidents SET ${sets.join(', ')} WHERE id = ?`).run(...params);

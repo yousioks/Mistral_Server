@@ -1,0 +1,28 @@
+# Custom Process Whitelist for Mistral Network Monitor
+# Add process names or command-line patterns to ignore (one per line, case-insensitive).
+# Lines starting with # are comments.
+
+# Project specific
+attack_simulator.py
+python3
+redis-server
+celery
+
+# Additional system daemons
+unattended-upgrades
+atd
+dbus-daemon
+smartd
+acpid
+systemd-oomd
+thermald
+snapd
+polkitd
+colord
+cups
+packagekitd
+gdm
+Xorg
+gnome-shell
+pulseaudio
+pipewire

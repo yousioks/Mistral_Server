@@ -297,8 +297,13 @@ function resolveRealGeoIP(incidentId, ip) {
               reputation: inc.geo ? inc.geo.reputation : 50,
               ip: ip
             };
+            
+            // Also update description with real GeoIP details
+            const baseDesc = inc.description.split(" [Регион:")[0];
+            inc.description = baseDesc + ` [Регион: ${inc.geo.country} (${inc.geo.code}) | ISP: ${inc.geo.isp} | Угроза: ${inc.geo.reputation}%]`;
+            
             try {
-              db.updateIncident(incidentId, { geo: inc.geo });
+              db.updateIncident(incidentId, { geo: inc.geo, description: inc.description });
               broadcast({ event: "incident_updated", data: inc });
             } catch (e) {
               logger.error("Failed to save real GeoIP to DB", { err: e.message });
@@ -320,13 +325,22 @@ function addIncident(severity, monitor, type, description, details = {}) {
   const extractedIp = extractIpFromIncident(description, details);
   const incId = uuidv4();
   const geoInfo = getMockGeoIP(extractedIp, incId);
+  
+  let enrichedDescription = description;
+  if (extractedIp && geoInfo) {
+    const geoText = `[Регион: ${geoInfo.country || 'Неизвестно'} (${geoInfo.code || '??'}) | ISP: ${geoInfo.isp || 'Неизвестно'} | Угроза: ${geoInfo.reputation}%]`;
+    if (!enrichedDescription.includes(geoText)) {
+      enrichedDescription += " " + geoText;
+    }
+  }
+
   const incident = { 
     id: incId, 
     timestamp: new Date().toISOString(), 
     severity: finalSeverity, 
     monitor, 
     type, 
-    description, 
+    description: enrichedDescription, 
     details, 
     status: "new", 
     contextBlock: contextLogs,
@@ -336,7 +350,7 @@ function addIncident(severity, monitor, type, description, details = {}) {
   try { db.addIncident(incident); } catch (e) { logger.error("DB addIncident failed", { err: e.message }); }
   incidents.unshift(incident);
   if (incidents.length > 5000) incidents.pop();
-  addLog("server", finalSeverity === "CRITICAL" ? "error" : "warn", `Incident: ${type}`, incident);
+  addLog("server", finalSeverity === "CRITICAL" ? "error" : "warn", `Инцидент [${type}]: ${enrichedDescription}`, incident);
   broadcast({ event: "incident", data: incident });
   notifyTelegram(incident);
 
