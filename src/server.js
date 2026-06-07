@@ -239,11 +239,15 @@ const MOCK_COUNTRIES = [
 ];
 
 function extractIpFromIncident(description, details) {
-  if (details) {
-    if (details.sourceIp) return details.sourceIp;
-    if (details.ip) return details.ip;
-    if (details.ddos && details.ddos.top_ips && Array.isArray(details.ddos.top_ips) && details.ddos.top_ips.length > 0) {
-      return details.ddos.top_ips[0].ip;
+  let det = details;
+  if (typeof det === "string") {
+    try { det = JSON.parse(det); } catch (_) {}
+  }
+  if (det) {
+    if (det.sourceIp) return det.sourceIp;
+    if (det.ip) return det.ip;
+    if (det.ddos && det.ddos.top_ips && Array.isArray(det.ddos.top_ips) && det.ddos.top_ips.length > 0) {
+      return det.ddos.top_ips[0].ip;
     }
   }
   const desc = description || "";
@@ -512,6 +516,15 @@ app.get("/api/incidents", (req, res) => {
   const { severity, limit = 100, offset = 0 } = req.query;
   try {
     const data = db.getIncidents({ severity, limit: Number(limit), offset: Number(offset) });
+    data.forEach(i => {
+      if (typeof i.details === "string") {
+        try { i.details = JSON.parse(i.details); } catch (_) {}
+      }
+      if (typeof i.geo === "string") {
+        try { i.geo = JSON.parse(i.geo); } catch (_) {}
+      }
+      i.ip = extractIpFromIncident(i.description, i.details);
+    });
     res.json({ total: data.length, data });
   } catch (e) {
     let data = incidents;
@@ -1145,6 +1158,7 @@ function loadPersistedData() {
       if (typeof i.geo === "string") {
         try { i.geo = JSON.parse(i.geo); } catch (_) {}
       }
+      i.ip = extractIpFromIncident(i.description, i.details);
     });
     incidents.push(...dbIncidents);
     logger.info(`Loaded ${incidents.length} incidents from database`);
