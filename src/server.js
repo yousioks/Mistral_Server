@@ -77,8 +77,8 @@ const usedNonces = new Set();
 // SOAR Settings Persistence
 const soarSettingsPath = path.join(__dirname, "../data/soar_settings.json");
 let soarSettings = {
-  autoBanDdos: false,
-  autoBanBruteForce: false,
+  autoBanDdos: true,
+  autoBanBruteForce: true,
   aiDefenseEnabled: false,
   aiMakeChanges: true,
   aiModel: "deepseek-v4-pro",
@@ -854,8 +854,8 @@ app.post("/api/reset-demo", (req, res) => {
 
     // 5. Reset SOAR settings
     soarSettings = {
-      autoBanDdos: false,
-      autoBanBruteForce: false,
+      autoBanDdos: true,
+      autoBanBruteForce: true,
       aiDefenseEnabled: false,
       aiMakeChanges: true,
       aiModel: "deepseek-v4-pro",
