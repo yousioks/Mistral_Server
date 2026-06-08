@@ -99,7 +99,7 @@ function get_tcp_connections()
     for line in out:gmatch("[^\n]+") do
         if first then first = false
         else
-            local state, local_, remote, process = line:match("^%S+%s+(%S+)%s+%S+%s+(%S+)%s+(%S+)%s+(.-)$")
+            local state, local_, remote, process = line:match("^(%S+)%s+%S+%s+%S+%s+(%S+)%s+(%S+)%s*(.*)$")
             if state then
                 table.insert(conns, {state = state, local_ = local_, remote = remote, process = process:gsub("%s+$", "")})
             end
@@ -153,9 +153,24 @@ function get_ddos_indicators(conns)
     for _, c in ipairs(conns) do
         if c.state == "SYN-RECV" then syn_recv = syn_recv + 1 end
         if c.state == "ESTAB" then established = established + 1 end
-        local ip = c.remote:match("^%[(.-)%]") or c.remote:match("^(.+):[^:]+$") or c.remote:match("^([^:]+)")
+        
+        -- Robust IP extraction from remote address (handles bracketed IPv6, raw IPv6, IPv4:port, raw IPv4/host)
+        local ip
+        local bracket_ip = c.remote:match("^%[([^%]]+)%]")
+        if bracket_ip then
+            ip = bracket_ip:gsub("^::ffff:", "")
+        else
+            local _, colons = c.remote:gsub(":", "")
+            if colons == 1 then
+                ip = c.remote:match("^([^:]+)")
+            else
+                ip = c.remote
+            end
+        end
         if ip then ip = ip:gsub("^::ffff:", "") end
-        if ip and ip ~= "0.0.0.0" and ip ~= "::" then
+        
+        -- Ignore wildcards, loops, and invalid bracket remnants
+        if ip and ip ~= "0.0.0.0" and ip ~= "::" and ip ~= "*" and not ip:find("%[") then
             local info = ip_counts[ip]
             if not info then
                 info = { count = 0, syn_recv = 0, estab = 0, ports = {} }
