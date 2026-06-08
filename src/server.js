@@ -323,6 +323,93 @@ function resolveRealGeoIP(incidentId, ip) {
   });
 }
 
+const BANNED_IP_WHITELIST = new Set([
+  "109.120.5.41",
+  "127.0.0.1",
+  "localhost",
+  "::1",
+  "::ffff:127.0.0.1"
+]);
+
+function isIpBannable(ip) {
+  if (!ip) return false;
+  
+  // Normalize target IP (strip ::ffff:)
+  const normalizedTarget = ip.replace(/^::ffff:/, "").trim();
+  
+  // Check strict whitelist
+  if (BANNED_IP_WHITELIST.has(normalizedTarget)) {
+    logger.info(`IP Ban skipped: ${ip} is whitelisted (109.120.5.41 or loopback)`);
+    return false;
+  }
+  
+  // Check active connected WSS clients to prevent lockout
+  const connectedIps = Array.from(clients.values()).map(c => c.ip ? c.ip.replace(/^::ffff:/, "").trim() : "");
+  if (connectedIps.includes(normalizedTarget)) {
+    logger.warn(`IP Ban skipped: ${ip} is associated with an active operator session to prevent lockout.`);
+    return false;
+  }
+  
+  return true;
+}
+
+function banIpInSystem(ip, reason) {
+  if (!isIpBannable(ip)) {
+    addLog("server", "info", `Блокировка IP ${ip} отменена: IP находится в белом списке или связан с активным оператором.`);
+    return false;
+  }
+  
+  try {
+    const { execSync } = require("child_process");
+    
+    // Ban in UFW
+    execSync(`ufw deny from ${ip} to any`, { stdio: "ignore" });
+    logger.info(`UFW banned IP: ${ip}`);
+    
+    // Ban in Fail2ban (if running)
+    try {
+      execSync(`fail2ban-client set sshd banip ${ip}`, { stdio: "ignore" });
+      logger.info(`Fail2ban banned IP in sshd jail: ${ip}`);
+    } catch (f2bErr) {
+      logger.warn(`Fail2ban ban failed (might not be running or installed): ${f2bErr.message}`);
+    }
+    
+    db.addQuarantine(ip, reason || "Manual block");
+    addLog("server", "warn", `IP помещен в карантин (UFW + fail2ban): ${ip}`, { ip, reason });
+    broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+    return true;
+  } catch (e) {
+    logger.error(`Failed to execute system ban for ${ip}: ${e.message}`);
+    return false;
+  }
+}
+
+function unbanIpInSystem(ip) {
+  try {
+    const { execSync } = require("child_process");
+    
+    // Unban in UFW
+    try {
+      execSync(`ufw delete deny from ${ip} to any`, { stdio: "ignore" });
+      logger.info(`UFW unbanned IP: ${ip}`);
+    } catch (_) {}
+    
+    // Unban in Fail2ban
+    try {
+      execSync(`fail2ban-client set sshd unbanip ${ip}`, { stdio: "ignore" });
+      logger.info(`Fail2ban unbanned IP in sshd jail: ${ip}`);
+    } catch (_) {}
+    
+    db.removeQuarantine(ip);
+    addLog("server", "info", `IP удален из карантина: ${ip}`, { ip });
+    broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+    return true;
+  } catch (e) {
+    logger.error(`Failed to execute system unban for ${ip}: ${e.message}`);
+    return false;
+  }
+}
+
 function addIncident(severity, monitor, type, description, details = {}) {
   const finalSeverity = autoCategorizeSeverity(type, description, severity);
   const contextLogs = serverLogs.slice(-100).map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
@@ -380,20 +467,8 @@ function addIncident(severity, monitor, type, description, details = {}) {
       reason = "SOAR: Auto-Ban Brute Force Attempt";
     }
     
-    // Safety check: Don't ban ourselves or the server itself
-    const serverHost = process.env.API_HOST || "127.0.0.1";
-    const isSafe = ip === "127.0.0.1" || ip === "localhost" || ip === "::1" || ip === "::ffff:127.0.0.1" || ip === serverHost;
-    
-    if (shouldBan && !isSafe) {
-      try {
-        const { execSync } = require("child_process");
-        execSync(`ufw deny from ${ip} to any`, { stdio: "ignore" });
-      } catch (e) {
-        logger.warn(`UFW block failed for ${ip}: ${e.message}`);
-      }
-      db.addQuarantine(ip, reason);
-      addLog("server", "warn", `SOAR Auto-Ban Neutralized Threat: ${ip} (${reason})`, { ip, reason });
-      broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+    if (shouldBan) {
+      banIpInSystem(ip, reason);
     }
   }
 
@@ -584,30 +659,22 @@ app.get("/api/quarantine", (req, res) => {
 app.post("/api/quarantine", (req, res) => {
   const { ip, reason } = req.body;
   if (!ip) return res.status(400).json({ error: "IP required" });
-  try {
-    const { execSync } = require("child_process");
-    execSync(`ufw deny from ${ip} to any`, { stdio: "ignore" }); // Mockable via dry-run later if needed, but assuming ufw exists
-  } catch (e) {
-    logger.warn(`UFW block failed for ${ip}: ${e.message}`);
+  const success = banIpInSystem(ip, reason);
+  if (success) {
+    res.json({ success: true, ip });
+  } else {
+    res.status(403).json({ error: "IP is whitelisted or belongs to active operator" });
   }
-  db.addQuarantine(ip, reason);
-  addLog("server", "warn", `IP Quarantined: ${ip}`, { ip, reason });
-  broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
-  res.json({ success: true, ip });
 });
 
 app.delete("/api/quarantine/:ip", (req, res) => {
   const ip = req.params.ip;
-  try {
-    const { execSync } = require("child_process");
-    execSync(`ufw delete deny from ${ip} to any`, { stdio: "ignore" });
-  } catch (e) {
-    logger.warn(`UFW unblock failed for ${ip}: ${e.message}`);
+  const success = unbanIpInSystem(ip);
+  if (success) {
+    res.json({ success: true, ip });
+  } else {
+    res.status(500).json({ error: "Failed to remove IP from system quarantine" });
   }
-  db.removeQuarantine(ip);
-  addLog("server", "info", `IP Un-quarantined: ${ip}`, { ip });
-  broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
-  res.json({ success: true, ip });
 });
 
 // ── Process Management ───────────────────────────────────────────────────────
@@ -752,15 +819,10 @@ app.post("/api/reset-demo", (req, res) => {
   if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
 
   try {
-    // 1. Release all quarantined IPs from UFW
+    // 1. Release all quarantined IPs from UFW and fail2ban
     const qList = db.getQuarantinedIps() || [];
-    const { execSync } = require("child_process");
     qList.forEach(q => {
-      try {
-        execSync(`ufw delete deny from ${q.ip} to any`, { stdio: "ignore" });
-      } catch (e) {
-        logger.warn(`UFW delete deny failed for ${q.ip} during reset`, { err: e.message });
-      }
+      unbanIpInSystem(q.ip);
     });
 
     // 2. Clear database tables
@@ -1009,6 +1071,57 @@ app.post("/api/run-audit", (req, res) => {
   });
   
   res.json({ success: true });
+});
+
+// ── UFW, Fail2ban & Lua security activator ──
+app.post("/api/activate-security", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+  
+  try {
+    const { exec } = require("child_process");
+    const scriptPath = path.join(__dirname, "..", "activate_security.sh");
+    addLog("server", "info", "Starting systems activation & check background script (UFW, Fail2ban, Lua Monitors)");
+    
+    exec(`sudo bash "${scriptPath}" > "${path.join(__dirname, "..", "logs", "security_activation.log")}" 2>&1`, (err) => {
+      if (err) {
+        logger.error("Security activation failed", { error: err.message });
+        addLog("server", "error", `Security activation failed: ${err.message}`);
+      } else {
+        logger.info("Security activation completed successfully");
+        addLog("server", "info", "Security activation completed successfully. UFW, Fail2ban, and Lua are configured.");
+      }
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Check UFW, Fail2ban & Lua security status ──
+app.get("/api/security-status", (req, res) => {
+  const { execSync } = require("child_process");
+  let ufwStatus = "unknown";
+  let fail2banStatus = "unknown";
+  let luaStatus = "unknown";
+  
+  try {
+    const ufwOut = execSync("sudo ufw status", { encoding: "utf8" });
+    ufwStatus = ufwOut.includes("Status: active") ? "active" : "inactive";
+  } catch (_) { ufwStatus = "not_installed"; }
+  
+  try {
+    const f2bOut = execSync("sudo fail2ban-client ping", { encoding: "utf8" });
+    fail2banStatus = f2bOut.includes("Server replied: pong") ? "active" : "inactive";
+  } catch (_) { fail2banStatus = "not_installed"; }
+  
+  try {
+    const scriptPath = path.join(__dirname, "..", "monitors", "run-monitors.sh");
+    const luaOut = execSync(`bash "${scriptPath}" status`, { encoding: "utf8" });
+    luaStatus = luaOut.includes("RUNNING") ? "active" : "inactive";
+  } catch (_) { luaStatus = "not_installed"; }
+  
+  res.json({ ufw: ufwStatus, fail2ban: fail2banStatus, lua: luaStatus });
 });
 
 // ── Bot notify endpoint (вызывается из addIncident) ──────────────────────────
