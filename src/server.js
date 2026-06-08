@@ -238,7 +238,7 @@ const MOCK_COUNTRIES = [
   { country: "Великобритания", code: "GB", lat: 55.37, lon: -3.43, isp: "British Telecommunications PLC", reputation: 24 }
 ];
 
-function extractIpFromIncident(description, details) {
+function extractIpFromIncident(description, details, type) {
   let det = details;
   if (typeof det === "string") {
     try { det = JSON.parse(det); } catch (_) {}
@@ -246,7 +246,11 @@ function extractIpFromIncident(description, details) {
   if (det) {
     if (det.sourceIp) return det.sourceIp;
     if (det.ip) return det.ip;
-    if (det.ddos && det.ddos.top_ips && Array.isArray(det.ddos.top_ips) && det.ddos.top_ips.length > 0) {
+    
+    // Only associate DDoS top connection IPs with actual DDoS or network-related incident types
+    const typeLower = (type || "").toLowerCase();
+    const isNetworkIncident = typeLower.includes("ddos") || typeLower.includes("flood") || typeLower.includes("port") || typeLower.includes("network");
+    if (isNetworkIncident && det.ddos && det.ddos.top_ips && Array.isArray(det.ddos.top_ips) && det.ddos.top_ips.length > 0) {
       return det.ddos.top_ips[0].ip;
     }
   }
@@ -413,7 +417,7 @@ function unbanIpInSystem(ip) {
 function addIncident(severity, monitor, type, description, details = {}) {
   const finalSeverity = autoCategorizeSeverity(type, description, severity);
   const contextLogs = serverLogs.slice(-100).map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
-  const extractedIp = extractIpFromIncident(description, details);
+  const extractedIp = extractIpFromIncident(description, details, type);
   const incId = uuidv4();
   const geoInfo = getMockGeoIP(extractedIp, incId);
   
@@ -598,7 +602,7 @@ app.get("/api/incidents", (req, res) => {
       if (typeof i.geo === "string") {
         try { i.geo = JSON.parse(i.geo); } catch (_) {}
       }
-      i.ip = extractIpFromIncident(i.description, i.details);
+      i.ip = extractIpFromIncident(i.description, i.details, i.type);
     });
     res.json({ total: data.length, data });
   } catch (e) {
@@ -1271,7 +1275,7 @@ function loadPersistedData() {
       if (typeof i.geo === "string") {
         try { i.geo = JSON.parse(i.geo); } catch (_) {}
       }
-      i.ip = extractIpFromIncident(i.description, i.details);
+      i.ip = extractIpFromIncident(i.description, i.details, i.type);
     });
     incidents.push(...dbIncidents);
     logger.info(`Loaded ${incidents.length} incidents from database`);
