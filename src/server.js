@@ -329,6 +329,7 @@ function resolveRealGeoIP(incidentId, ip) {
 
 const BANNED_IP_WHITELIST = new Set([
   "109.120.5.41",
+  "172.18.32.1",
   "127.0.0.1",
   "localhost",
   "::1",
