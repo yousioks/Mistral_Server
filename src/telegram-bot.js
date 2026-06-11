@@ -5,7 +5,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const db = require("./db.js");
 
 const API_PORT = process.env.API_PORT || 8080;
-const BOT_HTTP_PORT = process.env.BOT_HTTP_PORT || 8081;
+const BOT_HTTP_PORT = process.env.BOT_HTTP_PORT || 8082;
 const { TELEGRAM_BOT_TOKEN } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -40,10 +40,15 @@ async function reply(chatId, text, opts = {}) {
 const incidentsMap = new Map();
 
 async function broadcastAlert(incident) {
+  const { severity } = incident;
+  if (severity !== "CRITICAL" && severity !== "HIGH") {
+    return; // Ignore low or medium severity to prevent spamming
+  }
+
   const chatIds = db.getAllChatIds();
   if (!chatIds.length) { console.log("[Bot] Нет chat_id в БД"); return; }
   
-  const { id, severity, type, description, contextBlock, timestamp } = incident;
+  const { id, type, description, contextBlock, timestamp } = incident;
   incidentsMap.set(id, incident);
   if (incidentsMap.size > 500) {
     const firstKey = incidentsMap.keys().next().value;

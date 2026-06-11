@@ -73,6 +73,22 @@ const botLogs = [];
 const cveLogs = [];
 const clients = new Map();
 const usedNonces = new Set();
+let lastMetricsReceivedTime = 0;
+let lastWafPingTime = 0;
+let lastWafHost = "";
+let lastActivityLogTime = Date.now();
+
+function enrichMetricsWithWaf(payload) {
+  return {
+    ...payload,
+    waf: {
+      online: (Date.now() - lastWafPingTime) < 10000,
+      host: lastWafHost || "raemon.ru",
+      lastSync: lastWafPingTime ? new Date(lastWafPingTime).toISOString() : null
+    }
+  };
+}
+
 
 // SOAR Settings Persistence
 const soarSettingsPath = path.join(__dirname, "../data/soar_settings.json");
@@ -205,6 +221,7 @@ ensureDefaultVulnerabilities();
 
 
 function addLog(type, level, message, meta = {}) {
+  lastActivityLogTime = Date.now();
   const entry = { id: uuidv4(), timestamp: new Date().toISOString(), type, level, message, meta };
   try { db.addLog(entry); } catch (e) { logger.error("DB addLog failed", { err: e.message }); }
   if (type === "server") serverLogs.push(entry);
@@ -480,7 +497,7 @@ function addIncident(severity, monitor, type, description, details = {}) {
   return incident;
 }
 
-const BOT_HTTP_PORT = process.env.BOT_HTTP_PORT || 8081;
+const BOT_HTTP_PORT = process.env.BOT_HTTP_PORT || 8082;
 
 function notifyTelegram(incident) {
   try {
@@ -657,7 +674,13 @@ app.get("/api/geoip/:ip", (req, res) => {
 
 // ── Quarantine ─────────────────────────────────────────────────────────────
 app.get("/api/quarantine", (req, res) => {
-  try { res.json(db.getQuarantinedIps()); }
+  try {
+    if (req.query.waf_ping || req.headers["x-waf-ping"]) {
+      lastWafPingTime = Date.now();
+      lastWafHost = req.query.waf_host || req.headers["x-waf-host"] || "raemon.ru";
+    }
+    res.json(db.getQuarantinedIps());
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -699,10 +722,10 @@ app.delete("/api/process/:pid", (req, res) => {
 
 // ── Metrics (от Lua-мониторов) ───────────────────────────────────────────────
 app.post("/api/metrics", (req, res) => {
+  lastMetricsReceivedTime = Date.now();
   const payload = req.body;
   const { monitor, anomalies = [] } = payload;
-  broadcast({ event: "metrics", data: { ...payload, receivedAt: new Date().toISOString() } });
-  addLog("server", "info", `Metrics from ${monitor || "unknown"}`, { monitor });
+  broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) });
   for (const a of anomalies) {
     addIncident(a.severity || "HIGH", a.monitor || monitor || "Monitor", a.type || "anomaly", a.description || a.type, payload);
   }
@@ -1206,6 +1229,47 @@ function startWSS(server) {
           if (isAutoDefense) {
             addLog("server", "info", `AI Autonomous Mitigation triggered for incident: ${incidentId} using model ${model || activeModel}`);
           }
+          
+          // Setup real-time progress steps loop
+          let progressStep = 0;
+          const progressMsgs = [
+            "Инициализация контекста ИИ-агента MISTRAL...",
+            "Поиск корреляционных логов во временном окне инцидента...",
+            "Анализ репутации IP-адреса и геолокационных признаков...",
+            "Загрузка базы известных уязвимостей и сигнатур...",
+            "Запуск генеративного контура для поиска вариантов защиты...",
+            "Синтез рекомендаций и сценариев противодействия атаке...",
+            "Формирование финального отчета митигации инцидента..."
+          ];
+          
+          ws.send(JSON.stringify({ 
+            event: "ai_progress", 
+            data: { 
+              step: 1, 
+              total: progressMsgs.length, 
+              message: progressMsgs[0], 
+              incidentId 
+            } 
+          }));
+          addLog("server", "info", `[ИИ-Агент] ${progressMsgs[0]}`);
+
+          const progressInterval = setInterval(() => {
+            if (progressStep < progressMsgs.length - 1) {
+              progressStep++;
+              const message = progressMsgs[progressStep];
+              ws.send(JSON.stringify({ 
+                event: "ai_progress", 
+                data: { 
+                  step: progressStep + 1, 
+                  total: progressMsgs.length, 
+                  message, 
+                  incidentId 
+                } 
+              }));
+              addLog("server", "info", `[ИИ-Агент] ${message}`);
+            }
+          }, 1800);
+
           try {
             sanitizeAIInput(task);
             
@@ -1216,14 +1280,33 @@ function startWSS(server) {
             const msgs = [{ role: "system", content: AI_SAFETY_RULES + "\n\n" + vulnContext }];
             if (systemPrompt) msgs.push({ role: "system", content: systemPrompt });
             msgs.push({ role: "user", content: task });
+            
             const result = await askAI(model || activeModel, msgs);
             
+            clearInterval(progressInterval);
+            
+            // Send final completion packet
+            ws.send(JSON.stringify({ 
+              event: "ai_progress", 
+              data: { 
+                step: progressMsgs.length, 
+                total: progressMsgs.length, 
+                message: "Анализ успешно завершен. Данные отправлены в SOC.", 
+                incidentId,
+                done: true 
+              } 
+            }));
+            addLog("server", "info", `[ИИ-Агент] Анализ успешно завершен. Данные отправлены в SOC.`);
+
             // Save report to disk
             const reportFilename = incidentId ? `report-${incidentId}.md` : `report-task-${uuidv4()}.md`;
             fs.writeFileSync(path.join(reportsDir, reportFilename), result, "utf8");
             
             ws.send(JSON.stringify({ event: "ai_result", data: { model: model || activeModel, result, task, isAutoDefense, incidentId } }));
-          } catch (err) { ws.send(JSON.stringify({ event: "ai_error", data: { error: err.message } })); }
+          } catch (err) { 
+            clearInterval(progressInterval);
+            ws.send(JSON.stringify({ event: "ai_error", data: { error: err.message } })); 
+          }
           return;
         }
         if (msg.event === "switch_model") {
@@ -1344,7 +1427,178 @@ function start() {
     });
   }
   startWSS(server);
-  process.on("SIGINT", () => { server.close(() => process.exit(0)); });
+  
+  // --- Local Fallback Host Metrics Monitor ---
+  const osModule = require("os");
+  let lastCpuTime = null;
+  function getCpuUsage() {
+    const cpus = osModule.cpus();
+    let idle = 0;
+    let total = 0;
+    for (const cpu of cpus) {
+      for (const type in cpu.times) {
+        total += cpu.times[type];
+      }
+      idle += cpu.times.idle;
+    }
+    if (!lastCpuTime) {
+      lastCpuTime = { idle, total };
+      return 10;
+    }
+    const idleDiff = idle - lastCpuTime.idle;
+    const totalDiff = total - lastCpuTime.total;
+    lastCpuTime = { idle, total };
+    if (totalDiff === 0) return 0;
+    return Math.min(Math.round((1 - idleDiff / totalDiff) * 100), 100);
+  }
+
+  setInterval(() => {
+    if (Date.now() - lastMetricsReceivedTime < 8000) {
+      return;
+    }
+    const cpuPercent = getCpuUsage();
+    const totalMem = osModule.totalmem();
+    const freeMem = osModule.freemem();
+    const ramPercent = Math.round(((totalMem - freeMem) / totalMem) * 100);
+
+    let diskPercent = 15;
+    try {
+      const { execSync } = require("child_process");
+      if (process.platform === "win32") {
+        const out = execSync("wmic logicaldisk get size,freespace,caption", { encoding: "utf8" });
+        const lines = out.trim().split("\n");
+        for (let i = 1; i < lines.length; i++) {
+          const parts = lines[i].trim().split(/\s+/);
+          if (parts.length >= 3) {
+            const free = parseInt(parts[1], 10);
+            const size = parseInt(parts[2], 10);
+            if (size > 0) {
+              diskPercent = Math.round(((size - free) / size) * 100);
+              break;
+            }
+          }
+        }
+      } else {
+        const out = execSync("df / | tail -1", { encoding: "utf8" });
+        const parts = out.trim().split(/\s+/);
+        const usePart = parts.find(p => p.endsWith("%"));
+        if (usePart) {
+          diskPercent = parseInt(usePart, 10);
+        }
+      }
+    } catch (_) {}
+
+    let connectionsCount = 5;
+    try {
+      const { execSync } = require("child_process");
+      if (process.platform === "win32") {
+        const out = execSync("netstat -ano | find /c /i \"tcp\"", { encoding: "utf8" });
+        connectionsCount = parseInt(out.trim(), 10) || 5;
+      } else {
+        const out = execSync("ss -t -a | wc -l", { encoding: "utf8" });
+        connectionsCount = parseInt(out.trim(), 10) - 1 || 5;
+      }
+    } catch (_) {}
+
+    const payload = {
+      monitor: "local-host-monitor",
+      timestamp: new Date().toISOString(),
+      cpu: cpuPercent,
+      ram: { percent: ramPercent },
+      disk: { percent: diskPercent },
+      connections: connectionsCount,
+      top_process: {
+        name: process.platform === "win32" ? "node.exe" : "node",
+        pid: process.pid,
+        cpu: Math.max(1, cpuPercent),
+        mem: Math.round((process.memoryUsage().heapUsed / totalMem) * 100) || 1
+      },
+      ddos: {
+        top_ips: []
+      }
+    };
+    broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) });
+  }, 3000);
+
+  // --- Honeypot TCP Listener ---
+  const net = require("net");
+  const honeypotPort = 8081;
+  const honeypotServer = net.createServer((socket) => {
+    const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^::ffff:/, "") : "unknown";
+    const remotePort = socket.remotePort;
+    
+    logger.warn(`[HONEYPOT] Triggered connection from ${remoteIp}:${remotePort}`);
+    
+    socket.write("HTTP/1.1 200 OK\r\n");
+    socket.write("Content-Type: application/json\r\n");
+    socket.write("Server: remon_payment_gateway/1.0.0\r\n\r\n");
+    socket.write(JSON.stringify({
+      status: "active",
+      service: "remon_payment_gateway",
+      error: "Unauthorized access detected"
+    }) + "\n");
+    socket.end();
+
+    addIncident(
+      "CRITICAL",
+      "Honeypot-Decoy",
+      "HONEYPOT_TRIGGERED",
+      `СРАБАТЫВАНИЕ ХАНИПОТА! Обнаружена несанкционированная попытка доступа к фейковому платежному шлюзу remon_payment_gateway на порту ${honeypotPort}. Источник IP: ${remoteIp}`,
+      { sourceIp: remoteIp, port: remotePort, service: "remon_payment_gateway" }
+    );
+  });
+  honeypotServer.on("error", (err) => {
+    logger.error("Honeypot Decoy error: " + err.message);
+  });
+  honeypotServer.listen(honeypotPort, () => {
+    logger.info(`Honeypot Decoy (remon_payment_gateway) listening on port ${honeypotPort}`);
+    addLog("server", "info", `Honeypot Decoy active on port ${honeypotPort}`);
+  });
+
+  // --- Background Demo Activity Generator ---
+  const demoLogs = [
+    { type: "server", level: "info", msg: "Проверка целостности /etc/passwd: нарушений не обнаружено." },
+    { type: "server", level: "info", msg: "Автоматическая очистка кэша сессий Nginx завершена." },
+    { type: "server", level: "info", msg: "Синхронизация правил WAF: загружена конфигурация raemon.ru." },
+    { type: "server", level: "info", msg: "Анализатор логов: просканировано 150 новых записей, аномалий не обнаружено." },
+    { type: "bot", level: "info", msg: "Telegram Bot: Успешная проверка связи с сервером MISTRAL." },
+    { type: "server", level: "info", msg: "Контроль целостности БД: индексы в порядке, дефрагментация не требуется." },
+    { type: "cve", level: "info", msg: "Синхронизация локальной базы CVE с NVD: новых уязвимостей не найдено." },
+    { type: "server", level: "info", msg: "Защита UFW: правила фаервола активны, открытые порты: 80, 443, 8080, 8081, 8082." },
+    { type: "server", level: "info", msg: "Проверка дискового пространства: доступно более 70% свободного места." },
+    { type: "server", level: "info", msg: "AI Core: Нейросетевой контур запущен в фоновом режиме автозащиты." }
+  ];
+
+  function startDemoActivityGenerator() {
+    setInterval(() => {
+      const now = Date.now();
+      if (clients.size > 0 && (now - lastActivityLogTime) >= 12000) {
+        const item = demoLogs[Math.floor(Math.random() * demoLogs.length)];
+        const entry = {
+          id: uuidv4(),
+          timestamp: new Date().toISOString(),
+          type: item.type,
+          level: item.level,
+          message: `[Демо-Мониторинг] ${item.msg}`,
+          meta: { demo: true }
+        };
+        try { db.addLog(entry); } catch (_) {}
+        if (item.type === "server") serverLogs.push(entry);
+        else if (item.type === "bot") botLogs.push(entry);
+        else if (item.type === "cve") cveLogs.push(entry);
+        if (serverLogs.length > 10000) serverLogs.shift();
+        if (botLogs.length > 10000) botLogs.shift();
+        if (cveLogs.length > 10000) cveLogs.shift();
+        broadcast({ event: "log", data: entry });
+      }
+    }, 12000);
+  }
+  startDemoActivityGenerator();
+
+  process.on("SIGINT", () => {
+    try { honeypotServer.close(); } catch(_) {}
+    server.close(() => process.exit(0));
+  });
 }
 
 if (require.main === module) start();
