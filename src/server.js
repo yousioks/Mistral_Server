@@ -623,7 +623,11 @@ class ActiveDefenseEngine {
     
     try {
       db.addQuarantine(ip, reason || "Manual block");
-      logManager.addLog("server", "warn", `IP помещен в карантин (UFW + fail2ban) [Запуск фоновой блокировки]: ${ip}`, { ip, reason });
+      let logMessage = `IP помещен в карантин (UFW + fail2ban) [Запуск фоновой блокировки]: ${ip}`;
+      if (reason && (reason.startsWith("SOAR:") || reason.includes("Fallback Defense"))) {
+        logMessage = `[SOAR Авто-Реагирование] IP ${ip} автоматически заблокирован по правилу: ${reason}`;
+      }
+      logManager.addLog("server", "warn", logMessage, { ip, reason });
       if (typeof broadcast === "function") {
         broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
       }
