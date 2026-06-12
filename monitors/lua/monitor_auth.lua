@@ -8,7 +8,7 @@ local json = require("cjson")
 local SERVER_URL = os.getenv("MISTRAL_SERVER_URL") or "http://localhost:8080"
 local INTERVAL = tonumber(os.getenv("AUTH_CHECK_INTERVAL")) or 10
 local MAX_FAILED = tonumber(os.getenv("MAX_FAILED_LOGINS")) or 5
-local HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
+local HOSTNAME = io.popen("hostname"):read("*l") or "localhost"
 local API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
 -- ── Helpers ─────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ function get_failed_logins()
     local failed = {}
     for line in out:gmatch("[^\n]+") do
         if line:find("Failed password") or line:find("Invalid user") then
-            local ip = line:match("from%s+(%S+)") or "unknown"            table.insert(failed, {ip = ip, line = line:sub(-120)})
+            local ip = line:match("from%s+(%S+)") or "127.0.0.1"            table.insert(failed, {ip = ip, line = line:sub(-120)})
         end
     end
     return failed
@@ -103,7 +103,7 @@ function get_audit_logs(since_time)
             table.insert(logs, {
                 type = "audit",
                 level = level,
-                message = string.format("[Audit] %s (IP: %s) ran: %s", user, ip or "unknown", command)
+                message = string.format("[Audit] %s (IP: %s) ran: %s", user, ip or "127.0.0.1", command)
             })
         end
     end

@@ -7,7 +7,7 @@ local json = require("cjson")
 
 local SERVER_URL = os.getenv("MISTRAL_SERVER_URL") or "http://localhost:8080"
 local INTERVAL = tonumber(os.getenv("NETWORK_CHECK_INTERVAL")) or 8
-local HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
+local HOSTNAME = io.popen("hostname"):read("*l") or "localhost"
 local API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
 local PORT_WHITELIST = {22, 80, 443, 5000, 3000, 5432}
@@ -210,7 +210,7 @@ function check_anomalies(data)
         if not in_list(p, PORT_WHITELIST) then
             table.insert(anomalies, {
                 severity = "HIGH",
-                type = "UNKNOWN_PORT",
+                type = "UNAUTHORIZED_PORT",
                 description = "Подозрительный порт LISTEN: " .. p
             })
         end
@@ -222,8 +222,8 @@ function check_anomalies(data)
         end
         table.insert(anomalies, {
             severity = "MEDIUM",
-            type = "UNKNOWN_PROCESSES",
-            description = "Неизвестные процессы: " .. #data.unknown_processes .. " (первые: " .. table.concat(cmds, ", ") .. ")"
+            type = "UNAPPROVED_SYSTEM_PROCESS",
+            description = "Неавторизованные процессы: " .. #data.unknown_processes .. " (первые: " .. table.concat(cmds, ", ") .. ")"
         })
     end
     if data.ddos.syn_recv > 100 then
@@ -242,7 +242,7 @@ function check_anomalies(data)
     end
     for _, ip_info in ipairs(data.ddos.top_ips) do
         if ip_info.count > 200 then
-            local ports_str = #ip_info.ports > 0 and table.concat(ip_info.ports, ", ") or "unknown"
+            local ports_str = #ip_info.ports > 0 and table.concat(ip_info.ports, ", ") or "no open ports"
             table.insert(anomalies, {
                 severity = "HIGH",
                 type = "DDOS_IP",

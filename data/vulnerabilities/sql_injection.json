@@ -1,0 +1,8 @@
+{
+  "id": "sql_injection",
+  "name": "SQL Injection (SQLi)",
+  "severity": "HIGH",
+  "description": "Exploitation of SQL queries to gain unauthorized database access.",
+  "detection_rules": "Check logs for rules/keywords: UNION SELECT, SQLI_AUTH, sql syntax error, OR 1=1.",
+  "remediation": "Block attacker IP via UFW firewall. Sanitize incoming inputs, use parameterized queries, block suspicious parameters at WAF level."
+}

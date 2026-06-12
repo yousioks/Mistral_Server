@@ -1,0 +1,8 @@
+{
+  "id": "ransomware_encryption",
+  "name": "Ransomware Encryption Active",
+  "severity": "CRITICAL",
+  "description": "High-speed encryption of files in sensitive system directories accompanied by extreme CPU utilization spikes.",
+  "detection_rules": "Mass creation of '.enc' files, high CPU/disk activity (90%+), presence of ransom note files.",
+  "remediation": "Kill malicious process by PID immediately, restrict write permissions, isolate host from network, check backups."
+}

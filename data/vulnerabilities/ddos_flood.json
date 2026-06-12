@@ -1,0 +1,8 @@
+{
+  "id": "ddos_flood",
+  "name": "DDoS Network Flood",
+  "severity": "HIGH",
+  "description": "Volumetric denial of service (SYN Flood, HTTP Flood) aimed at exhausting network resources.",
+  "detection_rules": "Huge spike in active connections (ss -tlnp / metrics), network drop log entries, high system load.",
+  "remediation": "Enable SYN cookies, configure UFW rate limiting, route traffic through reverse proxy/WAF."
+}

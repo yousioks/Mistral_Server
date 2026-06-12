@@ -1,0 +1,8 @@
+{
+  "id": "honeypot_triggered",
+  "name": "Honeypot Decoy Triggered",
+  "severity": "CRITICAL",
+  "description": "Interaction with decoy resources such as a fake payment gateway (remon_payment_gateway) which only attackers scan or probe.",
+  "detection_rules": "Check logs for hits containing 'remon_payment_gateway' and incoming requests on port 8081.",
+  "remediation": "Instant quarantine (ufw deny from IP). Immediately notify security operations center (SOC)."
+}

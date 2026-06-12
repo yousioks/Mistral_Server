@@ -1,0 +1,8 @@
+{
+  "id": "privilege_escalation",
+  "name": "Privilege Escalation",
+  "severity": "CRITICAL",
+  "description": "Attempts to escalate execution privileges to root (UID 0) using exploits (e.g. DirtyPipe) or misconfigured sudoers.",
+  "detection_rules": "Log entries showing unauthorized modification of /etc/shadow or /etc/passwd, execution of abnormal su/sudo commands.",
+  "remediation": "Kill process, inspect kernel exploit vectors, review /etc/shadow integrity, check persistent crontabs."
+}

@@ -30,6 +30,8 @@ kill_proc() {
 echo -e "${RED}[MISTRAL]${NC} Stopping all services..."
 kill_proc "server"
 kill_proc "telegram-bot"
-kill_proc "monitors"
+if [ -f "monitors/run-monitors.sh" ]; then
+    bash monitors/run-monitors.sh stop > /dev/null 2>&1 || true
+fi
 kill_proc "log_forwarder"
 echo -e "${GREEN}[OK]${NC}   All services stopped"

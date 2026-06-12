@@ -1,0 +1,8 @@
+{
+  "id": "ssh_brute_force",
+  "name": "SSH Password Brute Force",
+  "severity": "HIGH",
+  "description": "Automated attempts to guess passwords on SSH (port 22).",
+  "detection_rules": "Check logs for failed login attempts (Failed password for root) and multiple failures followed by a success from the same IP.",
+  "remediation": "Block attacker IP via UFW. Disable password authentication for SSH, enforce SSH Key authentication, configure fail2ban."
+}

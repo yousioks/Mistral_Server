@@ -128,17 +128,16 @@ else
 fi
 
 # 3. Start Lua Monitors
-log_info "[3/3] Starting Lua System Monitors..."
+log_info "[3/5] Starting Lua System Monitors..."
 if [ -n "$LUA_BIN" ] && [ -x "$LUA_BIN" ]; then
     cd monitors
-    bash run-monitors.sh start > "$LOG_DIR/monitors.log" 2>&1 &
+    bash run-monitors.sh start > "$LOG_DIR/monitors.log" 2>&1
     cd "$SCRIPT_DIR"
-    save_pid "monitors" $!
     sleep 1
-    if kill -0 $(cat "$PID_DIR/monitors.pid") 2>/dev/null; then
+    if bash monitors/run-monitors.sh status | grep -q "RUNNING"; then
         log_ok "Lua monitors running (A: System, B: Auth, C: Network, D: Integrity)"
     else
-        log_warn "Monitors may have failed. Check logs/monitors.log"
+        log_warn "Monitors may have failed to start. Check logs/monitors.log"
     fi
 else
     log_warn "Skipping Lua monitors — Lua not available"

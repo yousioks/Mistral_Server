@@ -7,7 +7,7 @@ local json = require("cjson")
 
 local SERVER_URL = os.getenv("MISTRAL_SERVER_URL") or "http://localhost:8080"
 local INTERVAL = tonumber(os.getenv("INTEGRITY_CHECK_INTERVAL")) or 30
-local HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
+local HOSTNAME = io.popen("hostname"):read("*l") or "localhost"
 local API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
 local WATCH_PATHS_STR = os.getenv("WATCH_PATHS") or "/root/.ssh/authorized_keys,/etc/hosts"

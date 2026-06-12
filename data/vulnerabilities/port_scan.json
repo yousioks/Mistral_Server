@@ -1,0 +1,8 @@
+{
+  "id": "port_scan",
+  "name": "Port Scanning / Discovery",
+  "severity": "LOW",
+  "description": "Network discovery scanning (Nmap scan) to identify active services and ports.",
+  "detection_rules": "Port scans detected from firewall or network monitor logs checking sequential ports.",
+  "remediation": "Log scan event, check exposed services, disable unused ports, monitor subsequent actions from scanner IP."
+}

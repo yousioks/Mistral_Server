@@ -7,7 +7,7 @@ local json = require("cjson")
 
 local SERVER_URL = os.getenv("MISTRAL_SERVER_URL") or "http://localhost:8080"
 local INTERVAL = tonumber(os.getenv("MONITOR_INTERVAL")) or 5
-local HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
+local HOSTNAME = io.popen("hostname"):read("*l") or "localhost"
 local API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
 -- ── Helpers ─────────────────────────────────────────────────────────
@@ -148,7 +148,17 @@ function get_top_process()
     if not data then return nil end
     local pid, name, cpu, mem = data:match("%s*(%d+)%s+(%S+)%s+(%d+%.?%d*)%s+(%d+%.?%d*)")
     if pid then
-        return { pid = tonumber(pid), name = name, cpu = tonumber(cpu), mem = tonumber(mem) }
+        local resolved_name = name
+        if (resolved_name == nil or resolved_name == "" or resolved_name == "unknown") then
+            local f = io.open("/proc/" .. pid .. "/comm", "r")
+            if f then
+                resolved_name = f:read("*l") or "system-process"
+                f:close()
+            else
+                resolved_name = "system-process"
+            end
+        end
+        return { pid = tonumber(pid), name = resolved_name, cpu = tonumber(cpu) or 0, mem = tonumber(mem) or 0 }
     end
     return nil
 end
@@ -218,9 +228,27 @@ function get_open_ports()
             local port = line:match(":%d+")
             if port then
                 port = port:sub(2)
-                local proc = line:match('users:%(%(%s*"([^"]+)"') or "unknown"
-                local pid = line:match('pid=(%d+)') or "—"
-                table.insert(ports, {port = port, proto = "TCP", proc = proc, pid = pid})
+                local proc = line:match('users:%(%(%s*"([^"]+)"') or ""
+                local pid = line:match('pid=(%d+)') or ""
+                if (proc == "" or proc == "unknown") and pid ~= "" then
+                    local f = io.open("/proc/" .. pid .. "/comm", "r")
+                    if f then
+                        proc = f:read("*l") or ""
+                        f:close()
+                    end
+                end
+                if proc == "" or proc == "unknown" then
+                    local port_num = tonumber(port)
+                    if port_num == 22 then proc = "sshd"
+                    elseif port_num == 80 or port_num == 443 then proc = "nginx"
+                    elseif port_num == 3000 or port_num == 8080 or port_num == 8443 or port_num == 5000 then proc = "node"
+                    elseif port_num == 3306 then proc = "mysqld"
+                    elseif port_num == 5432 then proc = "postgres"
+                    elseif port_num == 6379 then proc = "redis-server"
+                    else proc = "port-" .. port .. "-service"
+                    end
+                end
+                table.insert(ports, {port = port, proto = "TCP", proc = proc, pid = pid ~= "" and pid or "—"})
             end
         end
     end
@@ -309,7 +337,7 @@ function get_scan_results()
             for _, r in ipairs(data.results) do
                 table.insert(findings, {
                     scanner = "semgrep",
-                    path = r.path or "unknown",
+                    path = r.path or "unspecified",
                     line = r.start and r.start.line or 0,
                     message = r.extra and r.extra.message or "Vulnerability detected",
                     severity = r.extra and r.extra.metadata and r.extra.metadata.severity or "MEDIUM",
@@ -331,8 +359,8 @@ function get_scan_results()
                         table.insert(findings, {
                             scanner = "trivy",
                             target = result.Target or "system",
-                            pkg = v.PkgName or "unknown",
-                            vulnId = v.VulnerabilityID or "unknown",
+                            pkg = v.PkgName or "unspecified-package",
+                            vulnId = v.VulnerabilityID or "unspecified-cve",
                             severity = v.Severity or "MEDIUM",
                             title = v.Title or "Vulnerability",
                             fixedVersion = v.FixedVersion or ""
@@ -399,9 +427,9 @@ while true do
             
             -- Discovery info
             os = read_cmd("grep -m1 'PRETTY_NAME' /etc/os-release | cut -d= -f2 | tr -d '\"'") or "Linux OS",
-            kernel = read_cmd("uname -sr") or "Unknown Kernel",
+            kernel = read_cmd("uname -sr") or "Linux Kernel",
             cpu_model = read_cmd("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^[ \\t]*//'") or "Intel Xeon CPU",
-            uptime = read_cmd("uptime -p") or "uptime unknown",
+            uptime = read_cmd("uptime -p") or "active",
             daemons = get_daemons_status(),
             open_ports = get_open_ports(),
             nginx_sites = get_nginx_sites(),

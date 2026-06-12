@@ -3,6 +3,43 @@ const path = require('path');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+
+// --- Application-Level Encryption Configurations ---
+const DB_ENCRYPTION_KEY = process.env.DB_ENCRYPTION_KEY || 'mistral-default-super-secure-key-123456';
+const IV_LENGTH = 16;
+const key = crypto.createHash('sha256').update(DB_ENCRYPTION_KEY).digest();
+
+function encrypt(text) {
+  if (typeof text !== 'string') text = JSON.stringify(text || {});
+  if (text.startsWith('ENC:')) return text;
+  try {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return 'ENC:' + iv.toString('hex') + ':' + encrypted;
+  } catch (e) {
+    console.error('[DB-Crypt] Encryption failed:', e);
+    return text;
+  }
+}
+
+function decrypt(text) {
+  if (typeof text !== 'string' || !text.startsWith('ENC:')) return text;
+  try {
+    const parts = text.split(':');
+    const iv = Buffer.from(parts[1], 'hex');
+    const encryptedText = Buffer.from(parts[2], 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (e) {
+    console.error('[DB-Crypt] Decryption failed:', e);
+    return text;
+  }
+}
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '../data', 'mistral.db');
 
@@ -146,6 +183,7 @@ function getAllChatIds() {
 
 // --- Incidents ---
 function addIncident(incident) {
+  const encDetails = encrypt(JSON.stringify(incident.details || {}));
   db.prepare(`
     INSERT INTO incidents (id, timestamp, severity, monitor, type, description, details, status, geo)
     VALUES (@id, @timestamp, @severity, @monitor, @type, @description, @details, @status, @geo)
@@ -156,7 +194,7 @@ function addIncident(incident) {
     monitor: incident.monitor || null,
     type: incident.type,
     description: incident.description,
-    details: JSON.stringify(incident.details || {}),
+    details: encDetails,
     status: incident.status || 'new',
     geo: incident.geo ? JSON.stringify(incident.geo) : null,
   });
@@ -169,7 +207,21 @@ function getIncidents({ severity, limit = 100, offset = 0 } = {}) {
   if (severity) { sql += ' AND severity = ?'; params.push(severity); }
   sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
-  return db.prepare(sql).all(...params);
+  const rows = db.prepare(sql).all(...params);
+  return rows.map(r => {
+    if (r.details) {
+      try {
+        r.details = JSON.parse(decrypt(r.details));
+      } catch (e) {
+        try {
+          r.details = JSON.parse(r.details); // fallback if not encrypted
+        } catch (_) {
+          r.details = {};
+        }
+      }
+    }
+    return r;
+  });
 }
 
 function updateIncident(id, { status, comment, severity, geo, description }) {
@@ -203,6 +255,7 @@ function getQuarantinedIps() {
 
 // --- Logs ---
 function addLog(entry) {
+  const encMeta = encrypt(JSON.stringify(entry.meta || {}));
   db.prepare(`
     INSERT INTO logs (id, timestamp, type, level, message, meta)
     VALUES (@id, @timestamp, @type, @level, @message, @meta)
@@ -212,7 +265,7 @@ function addLog(entry) {
     type: entry.type,
     level: entry.level,
     message: entry.message,
-    meta: JSON.stringify(entry.meta || {}),
+    meta: encMeta,
   });
 }
 
@@ -224,7 +277,21 @@ function getLogs({ type = 'server', level, startDate, endDate, limit = 100, offs
   if (endDate) { sql += ' AND timestamp <= ?'; params.push(endDate); }
   sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
-  return db.prepare(sql).all(...params);
+  const rows = db.prepare(sql).all(...params);
+  return rows.map(r => {
+    if (r.meta) {
+      try {
+        r.meta = JSON.parse(decrypt(r.meta));
+      } catch (e) {
+        try {
+          r.meta = JSON.parse(r.meta); // fallback
+        } catch (_) {
+          r.meta = {};
+        }
+      }
+    }
+    return r;
+  });
 }
 
 function countLogs(type, since) {
@@ -234,6 +301,7 @@ function countLogs(type, since) {
 
 // --- CVE Logs ---
 function addCveLog(entry) {
+  const encMeta = encrypt(JSON.stringify(entry.meta || {}));
   db.prepare(`
     INSERT INTO cve_logs (id, timestamp, level, message, meta, status)
     VALUES (@id, @timestamp, @level, @message, @meta, @status)
@@ -242,19 +310,34 @@ function addCveLog(entry) {
     timestamp: entry.timestamp || new Date().toISOString(),
     level: entry.level || 'info',
     message: entry.message,
-    meta: JSON.stringify(entry.meta || {}),
+    meta: encMeta,
     status: entry.status || 'new',
   });
 }
 
 function getCveLogs(limit = 100) {
-  return db.prepare('SELECT * FROM cve_logs ORDER BY timestamp DESC LIMIT ?').all(limit);
+  const rows = db.prepare('SELECT * FROM cve_logs ORDER BY timestamp DESC LIMIT ?').all(limit);
+  return rows.map(r => {
+    if (r.meta) {
+      try {
+        r.meta = JSON.parse(decrypt(r.meta));
+      } catch (e) {
+        try {
+          r.meta = JSON.parse(r.meta);
+        } catch (_) {
+          r.meta = {};
+        }
+      }
+    }
+    return r;
+  });
 }
 
 // --- Bot Logs ---
 function addBotLog(entry) {
   const chatId = entry.meta && entry.meta.chatId ? entry.meta.chatId : null;
   const nickname = entry.meta && entry.meta.nickname ? entry.meta.nickname : null;
+  const encMeta = encrypt(JSON.stringify(entry.meta || {}));
   db.prepare(`
     INSERT INTO bot_logs (id, timestamp, level, message, meta, chat_id, nickname)
     VALUES (@id, @timestamp, @level, @message, @meta, @chat_id, @nickname)
@@ -263,14 +346,28 @@ function addBotLog(entry) {
     timestamp: entry.timestamp || new Date().toISOString(),
     level: entry.level || 'info',
     message: entry.message,
-    meta: JSON.stringify(entry.meta || {}),
+    meta: encMeta,
     chat_id: chatId,
     nickname: nickname,
   });
 }
 
 function getBotLogs(limit = 100) {
-  return db.prepare('SELECT * FROM bot_logs ORDER BY timestamp DESC LIMIT ?').all(limit);
+  const rows = db.prepare('SELECT * FROM bot_logs ORDER BY timestamp DESC LIMIT ?').all(limit);
+  return rows.map(r => {
+    if (r.meta) {
+      try {
+        r.meta = JSON.parse(decrypt(r.meta));
+      } catch (e) {
+        try {
+          r.meta = JSON.parse(r.meta);
+        } catch (_) {
+          r.meta = {};
+        }
+      }
+    }
+    return r;
+  });
 }
 
 // --- Stats ---
@@ -321,9 +418,17 @@ function clearIncidents() {
   db.prepare('DELETE FROM incidents').run();
 }
 
+function deleteIncident(id) {
+  db.prepare('DELETE FROM incidents WHERE id = ?').run(id);
+}
+
+function deleteLog(id) {
+  db.prepare('DELETE FROM logs WHERE id = ?').run(id);
+}
+
 module.exports = {
-  addIncident, getIncidents, updateIncident,
-  addLog, getLogs, countLogs,
+  addIncident, getIncidents, updateIncident, deleteIncident,
+  addLog, getLogs, countLogs, deleteLog,
   addCveLog, getCveLogs,
   addBotLog, getBotLogs,
   getStats, cleanupOld,

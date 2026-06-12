@@ -6,7 +6,7 @@ local json = require("cjson")
 local M = {}
 
 M.SERVER_URL = os.getenv("MISTRAL_SERVER_URL") or "http://localhost:8080"
-M.HOSTNAME = io.popen("hostname"):read("*l") or "unknown"
+M.HOSTNAME = io.popen("hostname"):read("*l") or "localhost"
 M.API_KEY = os.getenv("WSS_SECRET_TOKEN") or ""
 
 function M.read_file(path)

@@ -1,12 +1,12 @@
-﻿{
+{
     "name":  "mistral-server",
     "version":  "1.0.0",
     "description":  "MISTRAL Defense Agent - Server component",
-    "main":  "server.js",
+    "main":  "src/server.js",
     "scripts":  {
-                    "start":  "node server.js",
-                    "dev":  "node --watch server.js",
-                    "bot":  "node telegram-bot.js",
+                    "start":  "node src/server.js",
+                    "dev":  "node --watch src/server.js",
+                    "bot":  "node src/telegram-bot.js",
                     "monitors":  "node monitors/run-monitors.js"
                 },
     "dependencies":  {

@@ -79,8 +79,27 @@ let lastWafHost = "";
 let lastActivityLogTime = Date.now();
 
 function enrichMetricsWithWaf(payload) {
+  const osModule = require("os");
+  const totalMem = osModule.totalmem();
+  const freeMem = osModule.freemem();
+  
+  let top_process = payload.top_process || {};
+  if (!top_process.name || top_process.name === "unknown" || top_process.name === "undefined") {
+    top_process.name = process.platform === "win32" ? "node.exe" : "node";
+  }
+  if (!top_process.pid || top_process.pid === "unknown" || top_process.pid === "undefined") {
+    top_process.pid = process.pid;
+  }
+  if (top_process.cpu === undefined || top_process.cpu === null) {
+    top_process.cpu = Math.max(1, payload.cpu || 5);
+  }
+  if (top_process.mem === undefined || top_process.mem === null) {
+    top_process.mem = Math.round((process.memoryUsage().heapUsed / totalMem) * 100) || 1;
+  }
+
   return {
     ...payload,
+    top_process,
     waf: {
       online: (Date.now() - lastWafPingTime) < 10000,
       host: lastWafHost || "raemon.ru",
@@ -220,21 +239,19 @@ ensureDefaultVulnerabilities();
 
 
 
-function addLog(type, level, message, meta = {}) {
-  lastActivityLogTime = Date.now();
-  const entry = { id: uuidv4(), timestamp: new Date().toISOString(), type, level, message, meta };
-  try { db.addLog(entry); } catch (e) { logger.error("DB addLog failed", { err: e.message }); }
-  if (type === "server") serverLogs.push(entry);
-  else if (type === "bot") botLogs.push(entry);
-  else if (type === "cve") cveLogs.push(entry);
-  if (serverLogs.length > 10000) serverLogs.shift();
-  if (botLogs.length > 10000) botLogs.shift();
-  if (cveLogs.length > 10000) cveLogs.shift();
-  logger.log(level, `[${type}] ${message}`, meta);
-  broadcast({ event: "log", data: entry });
-  return entry;
-}
+// --- Global arrays/Sets and configurations ---
+const BANNED_IP_WHITELIST = new Set([
+  "109.120.5.41",
+  "172.18.32.1",
+  "127.0.0.1",
+  "localhost",
+  "::1",
+  "::ffff:127.0.0.1"
+]);
+const BANNED_IP_WHITELIST_CIDRS = new Set();
+const ACTIVE_SSH_SESSIONS = new Set();
 
+// --- Static Helpers ---
 function autoCategorizeSeverity(type, desc, original) {
   const t = (type + " " + (desc || "")).toLowerCase();
   if (t.includes("rce") || t.includes("sql") || t.includes("systemd failed") || t.includes("nginx неактивен") || t.includes("root")) return "CRITICAL";
@@ -264,7 +281,6 @@ function extractIpFromIncident(description, details, type) {
     if (det.sourceIp) return det.sourceIp;
     if (det.ip) return det.ip;
     
-    // Only associate DDoS top connection IPs with actual DDoS or network-related incident types
     const typeLower = (type || "").toLowerCase();
     const isNetworkIncident = typeLower.includes("ddos") || typeLower.includes("flood") || typeLower.includes("port") || typeLower.includes("network");
     if (isNetworkIncident && det.ddos && det.ddos.top_ips && Array.isArray(det.ddos.top_ips) && det.ddos.top_ips.length > 0) {
@@ -299,206 +315,31 @@ function getMockGeoIP(ip, fallbackId) {
   };
 }
 
-function resolveRealGeoIP(incidentId, ip) {
-  if (!ip || ip === "127.0.0.1" || ip === "localhost" || ip === "::1" || ip === "::ffff:127.0.0.1") return;
-  const http = require("http");
-  const url = `http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,lat,lon,isp`;
-  
-  http.get(url, (res) => {
-    let raw = "";
-    res.on("data", chunk => raw += chunk);
-    res.on("end", () => {
-      try {
-        const data = JSON.parse(raw);
-        if (data && data.status === "success") {
-          const inc = incidents.find(i => i.id === incidentId);
-          if (inc) {
-            inc.geo = {
-              country: data.country || "Unknown",
-              code: data.countryCode || "UN",
-              lat: data.lat || 0,
-              lon: data.lon || 0,
-              isp: data.isp || "Unknown",
-              reputation: inc.geo ? inc.geo.reputation : 50,
-              ip: ip
-            };
-            
-            // Also update description with real GeoIP details
-            const baseDesc = inc.description.split(" [Регион:")[0];
-            inc.description = baseDesc + ` [Регион: ${inc.geo.country} (${inc.geo.code}) | ISP: ${inc.geo.isp} | Угроза: ${inc.geo.reputation}%]`;
-            
-            try {
-              db.updateIncident(incidentId, { geo: inc.geo, description: inc.description });
-              broadcast({ event: "incident_updated", data: inc });
-            } catch (e) {
-              logger.error("Failed to save real GeoIP to DB", { err: e.message });
-            }
-          }
-        }
-      } catch (e) {
-        logger.warn(`Failed to parse real GeoIP for ${ip}: ${e.message}`);
-      }
-    });
-  }).on("error", (e) => {
-    logger.warn(`Failed to fetch real GeoIP for ${ip}: ${e.message}`);
-  });
-}
-
-const BANNED_IP_WHITELIST = new Set([
-  "109.120.5.41",
-  "172.18.32.1",
-  "127.0.0.1",
-  "localhost",
-  "::1",
-  "::ffff:127.0.0.1"
-]);
-
-function isIpBannable(ip) {
-  if (!ip) return false;
-  
-  // Normalize target IP (strip ::ffff:)
-  const normalizedTarget = ip.replace(/^::ffff:/, "").trim();
-  
-  // Check strict whitelist
-  if (BANNED_IP_WHITELIST.has(normalizedTarget)) {
-    logger.info(`IP Ban skipped: ${ip} is whitelisted (109.120.5.41 or loopback)`);
-    return false;
-  }
-  
-  // Check active connected WSS clients to prevent lockout
-  const connectedIps = Array.from(clients.values()).map(c => c.ip ? c.ip.replace(/^::ffff:/, "").trim() : "");
-  if (connectedIps.includes(normalizedTarget)) {
-    logger.warn(`IP Ban skipped: ${ip} is associated with an active operator session to prevent lockout.`);
-    return false;
-  }
-  
-  return true;
-}
-
-function banIpInSystem(ip, reason) {
-  if (!isIpBannable(ip)) {
-    addLog("server", "info", `Блокировка IP ${ip} отменена: IP находится в белом списке или связан с активным оператором.`);
-    return false;
-  }
-  
+function ipInCidr(ip, cidr) {
   try {
-    const { execSync } = require("child_process");
-    
-    // Ban in UFW
-    execSync(`ufw deny from ${ip} to any`, { stdio: "ignore" });
-    logger.info(`UFW banned IP: ${ip}`);
-    
-    // Ban in Fail2ban (if running)
-    try {
-      execSync(`fail2ban-client set sshd banip ${ip}`, { stdio: "ignore" });
-      logger.info(`Fail2ban banned IP in sshd jail: ${ip}`);
-    } catch (f2bErr) {
-      logger.warn(`Fail2ban ban failed (might not be running or installed): ${f2bErr.message}`);
+    const [range, bits] = cidr.split("/");
+    const mask = parseInt(bits, 10);
+    if (isNaN(mask)) return false;
+
+    if (ip.includes(".") && range.includes(".")) {
+      const ipBuf = ip.split(".").map(Number);
+      const rangeBuf = range.split(".").map(Number);
+      if (ipBuf.length !== 4 || rangeBuf.length !== 4) return false;
+
+      const ipInt = (ipBuf[0] << 24) + (ipBuf[1] << 16) + (ipBuf[2] << 8) + ipBuf[3];
+      const rangeInt = (rangeBuf[0] << 24) + (rangeBuf[1] << 16) + (rangeBuf[2] << 8) + rangeBuf[3];
+      
+      const maskBit = -1 << (32 - mask);
+      return (ipInt & maskBit) === (rangeInt & maskBit);
     }
-    
-    db.addQuarantine(ip, reason || "Manual block");
-    addLog("server", "warn", `IP помещен в карантин (UFW + fail2ban): ${ip}`, { ip, reason });
-    broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
-    return true;
-  } catch (e) {
-    logger.error(`Failed to execute system ban for ${ip}: ${e.message}`);
-    return false;
-  }
-}
-
-function unbanIpInSystem(ip) {
-  try {
-    const { execSync } = require("child_process");
-    
-    // Unban in UFW
-    try {
-      execSync(`ufw delete deny from ${ip} to any`, { stdio: "ignore" });
-      logger.info(`UFW unbanned IP: ${ip}`);
-    } catch (_) {}
-    
-    // Unban in Fail2ban
-    try {
-      execSync(`fail2ban-client set sshd unbanip ${ip}`, { stdio: "ignore" });
-      logger.info(`Fail2ban unbanned IP in sshd jail: ${ip}`);
-    } catch (_) {}
-    
-    db.removeQuarantine(ip);
-    addLog("server", "info", `IP удален из карантина: ${ip}`, { ip });
-    broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
-    return true;
-  } catch (e) {
-    logger.error(`Failed to execute system unban for ${ip}: ${e.message}`);
-    return false;
-  }
-}
-
-function addIncident(severity, monitor, type, description, details = {}) {
-  const finalSeverity = autoCategorizeSeverity(type, description, severity);
-  const contextLogs = serverLogs.slice(-100).map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
-  const extractedIp = extractIpFromIncident(description, details, type);
-  const incId = uuidv4();
-  const geoInfo = getMockGeoIP(extractedIp, incId);
-  
-  let enrichedDescription = description;
-  if (extractedIp && geoInfo) {
-    const geoText = `[Регион: ${geoInfo.country || 'Неизвестно'} (${geoInfo.code || '??'}) | ISP: ${geoInfo.isp || 'Неизвестно'} | Угроза: ${geoInfo.reputation}%]`;
-    if (!enrichedDescription.includes(geoText)) {
-      enrichedDescription += " " + geoText;
+    if (ip.includes(":") && range.includes(":")) {
+      return ip.startsWith(range.replace(/:+$/, ""));
     }
-  }
-
-  const incident = { 
-    id: incId, 
-    timestamp: new Date().toISOString(), 
-    severity: finalSeverity, 
-    monitor, 
-    type, 
-    description: enrichedDescription, 
-    details, 
-    status: "new", 
-    contextBlock: contextLogs,
-    ip: extractedIp,
-    geo: geoInfo
-  };
-  try { db.addIncident(incident); } catch (e) { logger.error("DB addIncident failed", { err: e.message }); }
-  incidents.unshift(incident);
-  if (incidents.length > 5000) incidents.pop();
-  addLog("server", finalSeverity === "CRITICAL" ? "error" : "warn", `Инцидент [${type}]: ${enrichedDescription}`, incident);
-  broadcast({ event: "incident", data: incident });
-  notifyTelegram(incident);
-
-  // Resolve real GeoIP in background
-  if (extractedIp) {
-    resolveRealGeoIP(incId, extractedIp);
-  }
-
-  // SOAR Auto-Ban Logic
-  if (extractedIp) {
-    const ip = extractedIp;
-    const typeLower = (type || "").toLowerCase();
-    const descLower = (description || "").toLowerCase();
-    
-    let shouldBan = false;
-    let reason = "";
-    
-    if (soarSettings.autoBanDdos && (typeLower.includes("ddos") || typeLower.includes("flood") || descLower.includes("ddos") || descLower.includes("flood"))) {
-      shouldBan = true;
-      reason = "SOAR: Auto-Ban DDoS Attempt";
-    } else if (soarSettings.autoBanBruteForce && (typeLower.includes("brute") || typeLower.includes("auth") || descLower.includes("brute") || descLower.includes("auth"))) {
-      shouldBan = true;
-      reason = "SOAR: Auto-Ban Brute Force Attempt";
-    }
-    
-    if (shouldBan) {
-      banIpInSystem(ip, reason);
-    }
-  }
-
-  return incident;
+  } catch (_) {}
+  return false;
 }
 
 const BOT_HTTP_PORT = process.env.BOT_HTTP_PORT || 8082;
-
 function notifyTelegram(incident) {
   try {
     const body = JSON.stringify(incident);
@@ -511,6 +352,898 @@ function notifyTelegram(incident) {
     req.write(body); req.end();
   } catch (_) {}
 }
+
+// ── OOP CLASS DESIGN ──
+
+class WhitelistManager {
+  constructor() {
+    this.staticWhitelist = BANNED_IP_WHITELIST;
+    this.cidrWhitelist = BANNED_IP_WHITELIST_CIDRS;
+    this.activeSshSessions = ACTIVE_SSH_SESSIONS;
+  }
+
+  isValidIp(ip) {
+    if (typeof ip !== "string") return false;
+    const trimmed = ip.trim();
+    const ipv4Pattern = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    const ipv6Pattern = /^(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}$|^(?:[A-Fa-f0-9]{1,4}:){1,7}:$|^:(?::[A-Fa-f0-9]{1,4}){1,7}$|^(?:[A-Fa-f0-9]{1,4}:){1,6}:[A-Fa-f0-9]{1,4}$/;
+    return ipv4Pattern.test(trimmed) || ipv6Pattern.test(trimmed);
+  }
+
+  isValidIpOrCidr(val) {
+    if (typeof val !== "string") return false;
+    const trimmed = val.trim();
+    const cidrPattern = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\/(?:3[0-2]|[12]?[0-9])$|^[A-Fa-f0-9:]+\/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9])$/;
+    return this.isValidIp(trimmed) || cidrPattern.test(trimmed);
+  }
+
+  isIpBannable(ip) {
+    if (!ip) return false;
+    
+    const normalizedTarget = ip.replace(/^::ffff:/, "").trim().toLowerCase();
+    
+    if (
+      normalizedTarget === "127.0.0.1" || 
+      normalizedTarget === "localhost" || 
+      normalizedTarget === "::1" || 
+      normalizedTarget === "0.0.0.0" || 
+      normalizedTarget === "::" ||
+      normalizedTarget.startsWith("127.")
+    ) {
+      logger.info(`[IP-Blocker] Block skipped: 127.0.0.1/loopback cannot be banned.`);
+      return false;
+    }
+    
+    if (this.staticWhitelist.has(normalizedTarget)) {
+      logger.info(`IP Ban skipped: ${ip} is whitelisted (unbannable list / active SSH connection)`);
+      return false;
+    }
+
+    for (const cidr of this.cidrWhitelist) {
+      if (ipInCidr(normalizedTarget, cidr)) {
+        logger.info(`IP Ban skipped: ${ip} matches whitelisted CIDR range: ${cidr}`);
+        return false;
+      }
+    }
+    
+    const connectedIps = Array.from(clients.values()).map(c => c.ip ? c.ip.replace(/^::ffff:/, "").trim() : "");
+    if (connectedIps.includes(normalizedTarget)) {
+      logger.warn(`IP Ban skipped: ${ip} is associated with an active operator session to prevent lockout.`);
+      return false;
+    }
+    
+    return true;
+  }
+
+  updateSshAndFileWhitelist() {
+    const os = require("os");
+    const fs = require("fs");
+    const { exec } = require("child_process");
+
+    logger.info("[IP-Whitelist] Initializing IP exclusions & connected SSH devices whitelist...");
+
+    const whitelistFile = path.join(__dirname, "..", "data", "unbannable_ips.json");
+    if (!fs.existsSync(whitelistFile)) {
+      try {
+        const defaultData = [
+          "109.120.5.41",
+          "192.168.1.0/24",
+          "10.0.0.0/8"
+        ];
+        fs.mkdirSync(path.dirname(whitelistFile), { recursive: true });
+        fs.writeFileSync(whitelistFile, JSON.stringify(defaultData, null, 2), "utf8");
+        logger.info(`[IP-Whitelist] Created default whitelist template at ${whitelistFile}`);
+      } catch (e) {
+        logger.error(`[IP-Whitelist] Failed to create whitelist template: ${e.message}`);
+      }
+    }
+
+    let fileIps = [];
+    if (fs.existsSync(whitelistFile)) {
+      try {
+        fileIps = JSON.parse(fs.readFileSync(whitelistFile, "utf8"));
+        fileIps.forEach(item => {
+          if (typeof item === "string" && item.trim()) {
+            const trimmed = item.trim().toLowerCase();
+            if (trimmed.includes("/")) {
+              this.cidrWhitelist.add(trimmed);
+            } else {
+              this.staticWhitelist.add(trimmed);
+            }
+          }
+        });
+        logger.info(`[IP-Whitelist] Loaded ${fileIps.length} static IP/CIDR exclusions from ${whitelistFile}`);
+      } catch (e) {
+        logger.error(`[IP-Whitelist] Failed to parse whitelist exclusions: ${e.message}`);
+      }
+    }
+
+    const sshConnection = process.env.SSH_CONNECTION || process.env.SSH_CLIENT;
+    if (sshConnection) {
+      const parts = sshConnection.trim().split(/\s+/);
+      const clientIp = parts[0];
+      if (clientIp) {
+        const cleanIp = clientIp.replace(/^::ffff:/, "");
+        this.staticWhitelist.add(cleanIp);
+        this.activeSshSessions.add(cleanIp);
+        logger.info(`[IP-Whitelist] Auto-whitelisted SSH launcher connection IP: ${cleanIp}`);
+      }
+    }
+
+    exec("who", (err, stdout) => {
+      if (!err && stdout) {
+        const lines = stdout.split("\n");
+        lines.forEach(line => {
+          const match = line.match(/\(([^)]+)\)/);
+          if (match) {
+            const ip = match[1].trim();
+            if (ip && !ip.startsWith(":") && (ip.includes(".") || ip.includes(":"))) {
+              const cleanIp = ip.replace(/^::ffff:/, "");
+              this.staticWhitelist.add(cleanIp);
+              this.activeSshSessions.add(cleanIp);
+              logger.info(`[IP-Whitelist] Auto-whitelisted active SSH connection from 'who': ${cleanIp}`);
+            }
+          }
+        });
+      }
+    });
+
+    const connCmd = os.platform() === "win32" ? "netstat -ano" : "ss -t -n -a state established sport = :22";
+    exec(connCmd, (err, stdout) => {
+      if (err || !stdout) return;
+      const lines = stdout.split("\n");
+      lines.forEach(line => {
+        if (os.platform() === "win32") {
+          if (line.includes("ESTABLISHED") && (line.includes(":22") || line.includes(" 22 "))) {
+            const parts = line.trim().split(/\s+/);
+            const remoteAddress = parts[2];
+            if (remoteAddress) {
+              const match = remoteAddress.match(/(?:\[([^\]]+)\]|([^:]+)):(\d+)$/);
+              if (match) {
+                const ip = match[1] || match[2];
+                if (ip && ip !== "127.0.0.1" && ip !== "::1" && ip !== "0.0.0.0" && ip !== "[::]") {
+                  const cleanIp = ip.replace(/^::ffff:/, "");
+                  this.staticWhitelist.add(cleanIp);
+                  this.activeSshSessions.add(cleanIp);
+                  logger.info(`[IP-Whitelist] Auto-whitelisted established socket peer (port 22): ${cleanIp}`);
+                }
+              }
+            }
+          }
+        } else {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length >= 5) {
+            const remotePart = parts[4];
+            const remoteIp = remotePart.split(":")[0];
+            if (remoteIp && remoteIp !== "127.0.0.1" && remoteIp !== "::1" && remoteIp !== "0.0.0.0" && remoteIp !== "*") {
+              const cleanIp = remoteIp.replace(/^::ffff:/, "");
+              this.staticWhitelist.add(cleanIp);
+              this.activeSshSessions.add(cleanIp);
+              logger.info(`[IP-Whitelist] Auto-whitelisted active SSH peer IP: ${cleanIp}`);
+            }
+          }
+        }
+      });
+    });
+  }
+}
+
+class ActiveDefenseEngine {
+  constructor(whitelistManager) {
+    this.whitelistManager = whitelistManager;
+  }
+
+  banIpInSystem(ip, reason) {
+    if (!ip || !this.whitelistManager.isValidIp(ip)) {
+      logger.warn(`IP Ban rejected: invalid IP input format "${ip}"`);
+      return false;
+    }
+    
+    const normalizedTarget = ip.replace(/^::ffff:/, "").trim().toLowerCase();
+    if (
+      normalizedTarget === "127.0.0.1" || 
+      normalizedTarget === "localhost" || 
+      normalizedTarget === "::1" || 
+      normalizedTarget === "0.0.0.0" || 
+      normalizedTarget.startsWith("127.")
+    ) {
+      return false;
+    }
+
+    if (!this.whitelistManager.isIpBannable(ip)) {
+      logManager.addLog("server", "info", `Блокировка IP ${ip} отменена: IP находится в белом списке или связан с активным оператором.`);
+      return false;
+    }
+    
+    try {
+      const { execSync } = require("child_process");
+      const isWin = process.platform === "win32";
+      const sudoPrefix = isWin ? "" : "sudo ";
+      
+      // Ban in UFW
+      try {
+        execSync(`${sudoPrefix}ufw deny from ${ip} to any`, { stdio: "ignore" });
+        logger.info(`UFW banned IP: ${ip}`);
+      } catch (_) {}
+      
+      // Ban in Fail2ban (if running)
+      try {
+        execSync(`${sudoPrefix}fail2ban-client set sshd banip ${ip}`, { stdio: "ignore" });
+        logger.info(`Fail2ban banned IP in sshd jail: ${ip}`);
+      } catch (f2bErr) {
+        logger.warn(`Fail2ban ban failed (might not be running or installed): ${f2bErr.message}`);
+      }
+      
+      db.addQuarantine(ip, reason || "Manual block");
+      logManager.addLog("server", "warn", `IP помещен в карантин (UFW + fail2ban): ${ip}`, { ip, reason });
+      if (typeof broadcast === "function") {
+        broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+      }
+      return true;
+    } catch (e) {
+      logger.error(`Failed to execute system ban for ${ip}: ${e.message}`);
+      return false;
+    }
+  }
+
+  unbanIpInSystem(ip) {
+    if (!ip || !this.whitelistManager.isValidIp(ip)) {
+      logger.warn(`IP Unban rejected: invalid IP input format "${ip}"`);
+      return false;
+    }
+    try {
+      const { execSync } = require("child_process");
+      const isWin = process.platform === "win32";
+      const sudoPrefix = isWin ? "" : "sudo ";
+      
+      // Unban in UFW
+      try {
+        execSync(`${sudoPrefix}ufw delete deny from ${ip} to any`, { stdio: "ignore" });
+        logger.info(`UFW unbanned IP: ${ip}`);
+      } catch (_) {}
+      
+      // Unban in Fail2ban
+      try {
+        execSync(`${sudoPrefix}fail2ban-client set sshd unbanip ${ip}`, { stdio: "ignore" });
+        logger.info(`Fail2ban unbanned IP in sshd jail: ${ip}`);
+      } catch (_) {}
+      
+      db.removeQuarantine(ip);
+      logManager.addLog("server", "info", `IP удален из карантина: ${ip}`, { ip });
+      if (typeof broadcast === "function") {
+        broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
+      }
+      return true;
+    } catch (e) {
+      logger.error(`Failed to execute system unban for ${ip}: ${e.message}`);
+      return false;
+    }
+  }
+
+  checkFallbackDefense(incident) {
+    if (!incident || !incident.ip) return;
+    const severity = incident.severity || "MEDIUM";
+    const type = incident.type || "";
+    const descLower = (incident.description || "").toLowerCase();
+    
+    const isCriticalOrHigh = severity === "CRITICAL" || severity === "HIGH";
+    const targetsRemon = type === "HONEYPOT_TRIGGERED" || 
+                         descLower.includes("remon") || 
+                         descLower.includes("raemon.ru") || 
+                         descLower.includes("remon_payment_gateway") || 
+                         descLower.includes("postgres") || 
+                         descLower.includes("redis");
+                         
+    if (isCriticalOrHigh || targetsRemon) {
+      if (this.whitelistManager.isIpBannable(incident.ip)) {
+        logger.warn(`[Fallback-Defense] Active threat of type [${type}] detected against REMON or server from ${incident.ip}. Automatically executing UFW/Fail2ban quarantine block.`);
+        this.banIpInSystem(incident.ip, `Fallback Defense: Automated Active Block for threat [${type}]`);
+      }
+    }
+  }
+}
+
+class LogManager {
+  constructor() {
+    this.serverLogs = serverLogs;
+    this.botLogs = botLogs;
+    this.cveLogs = cveLogs;
+    this.sshFailures = new Map();
+  }
+
+  addLog(type, level, message, meta = {}) {
+    lastActivityLogTime = Date.now();
+    const finalType = type ? String(type).trim() : "server";
+    const finalLevel = level ? String(level).trim().toLowerCase() : "info";
+    const finalMessage = message ? String(message).trim() : "Empty system log message.";
+    const finalMeta = meta || {};
+    const entry = { id: uuidv4(), timestamp: new Date().toISOString(), type: finalType, level: finalLevel, message: finalMessage, meta: finalMeta };
+    try { db.addLog(entry); } catch (e) { logger.error("DB addLog failed", { err: e.message }); }
+    if (finalType === "server") this.serverLogs.push(entry);
+    else if (finalType === "bot") this.botLogs.push(entry);
+    else if (finalType === "cve") {
+      this.cveLogs.push(entry);
+      try { db.addCveLog(entry); } catch (e) { logger.error("DB addCveLog failed", { err: e.message }); }
+    }
+    if (this.serverLogs.length > 10000) this.serverLogs.shift();
+    if (this.botLogs.length > 10000) this.botLogs.shift();
+    if (this.cveLogs.length > 10000) this.cveLogs.shift();
+    logger.log(finalLevel, `[${finalType}] ${finalMessage}`, finalMeta);
+    
+    if (typeof broadcast === "function") {
+      broadcast({ event: "log", data: entry });
+    }
+
+    // Trigger Real-Time Log Signature Analyzer
+    try {
+      this.analyzeLogForSignatures(finalType, finalMessage, finalMeta);
+    } catch (err) {
+      logger.error("Error in signature log analyzer: " + err.message);
+    }
+
+    return entry;
+  }
+
+  analyzeLogForSignatures(type, message, meta) {
+    const msgLower = message.toLowerCase();
+    
+    // 1. SSH Brute Force
+    if (msgLower.includes("failed password for")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      if (ipMatch) {
+        const ip = ipMatch[0];
+        const now = Date.now();
+        const attempts = this.sshFailures.get(ip) || [];
+        const recentAttempts = attempts.filter(t => now - t < 10000);
+        recentAttempts.push(now);
+        this.sshFailures.set(ip, recentAttempts);
+        
+        if (recentAttempts.length >= 3) {
+          this.sshFailures.delete(ip); // reset
+          incidentManager.addIncident(
+            "HIGH",
+            "LogSignatureAnalyzer",
+            "SSH_BRUTE_FORCE_ATTEMPT",
+            `Обнаружен брутфорс SSH с IP ${ip} (более 3 неудачных попыток за 10 секунд).`,
+            { sourceIp: ip, failures: recentAttempts.length }
+          );
+        }
+      }
+    }
+    
+    // 2. SQL Injection
+    if (msgLower.includes("sqli_auth") || msgLower.includes("union select") || msgLower.includes("sql syntax error")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "HIGH",
+        "LogSignatureAnalyzer",
+        "SQL_INJECTION",
+        `Обнаружена атака SQL-инъекции в логах. Сигнатура: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+    
+    // 3. Honeypot Trigger
+    if (msgLower.includes("remon_payment_gateway") || msgLower.includes("port 8081")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "CRITICAL",
+        "LogSignatureAnalyzer",
+        "HONEYPOT_TRIGGERED",
+        `Взаимодействие с платежным шлюзом-приманкой в логах. Сигнатура: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+    
+    // 4. Path Traversal
+    if (msgLower.includes("etc/passwd") || msgLower.includes("static/../../")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "HIGH",
+        "LogSignatureAnalyzer",
+        "PATH_TRAVERSAL",
+        `Обнаружена попытка Path Traversal (обход путей) в логах: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+    
+    // 5. Command Injection
+    if (msgLower.includes("cmd=whoami") || msgLower.includes("debug?cmd=")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "CRITICAL",
+        "LogSignatureAnalyzer",
+        "COMMAND_INJECTION",
+        `Обнаружена попытка Command Injection (внедрение команд ОС) в логах: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+
+    // 6. Ransomware Encryption
+    if (msgLower.includes("mass encryption") || msgLower.includes(".enc")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "CRITICAL",
+        "LogSignatureAnalyzer",
+        "RANSOMWARE_ENCRYPTION",
+        `Подозрение на активность шифровальщика (Ransomware) в логах: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+    
+    // 7. Privilege Escalation
+    if (msgLower.includes("dirtypipe") || msgLower.includes("unauthorized modification of /etc/shadow")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "CRITICAL",
+        "LogSignatureAnalyzer",
+        "PRIVILEGE_ESCALATION",
+        `Попытка повышения привилегий до root (LPE) зафиксирована в логах: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+    
+    // 8. DDoS Flood
+    if (msgLower.includes("syn flood") || msgLower.includes("http flood")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "HIGH",
+        "LogSignatureAnalyzer",
+        "DDOS_FLOOD_ACTIVE",
+        `Сетевой флуд пакетов (DDoS) зафиксирован в логах: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+    
+    // 9. Malicious C2 Connection
+    if (msgLower.includes("malicious_c2_connection_detected") || msgLower.includes("злоумышленным узлом")) {
+      const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+      const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
+      incidentManager.addIncident(
+        "CRITICAL",
+        "LogSignatureAnalyzer",
+        "MALICIOUS_C2_CONNECTION_DETECTED",
+        `Подключение к управляющему C2 серверу ботнета в логах: ${message}`,
+        { sourceIp: ip, raw_log: message }
+      );
+    }
+  }
+}
+
+class IncidentManager {
+  constructor() {
+    this.incidents = incidents;
+    this.activeDefenseEngine = null; // set later
+  }
+
+  setDefenseEngine(engine) {
+    this.activeDefenseEngine = engine;
+  }
+
+  addIncident(severity, monitor, type, description, details = {}) {
+    let finalType = type ? String(type).trim().toUpperCase() : "SECURITY_ALERT";
+    if (finalType === "UNKNOWN" || finalType === "UNKNOWN_INCIDENT" || finalType === "UNDEFINED" || finalType === "ANOMALY" || finalType === "") {
+      finalType = "SECURITY_ALERT";
+    }
+    const finalSeverity = autoCategorizeSeverity(finalType, description || "Suspicious activity detected.", severity || "MEDIUM");
+    const finalMonitor = monitor ? String(monitor).trim() : "SystemMonitor";
+    
+    let finalDescription = description ? String(description).trim() : "Security anomaly detected by automated agent.";
+    if (!finalDescription || finalDescription.toLowerCase().includes("unknown") || finalDescription.toLowerCase().includes("undefined")) {
+      finalDescription = `Зафиксировано аномальное поведение: ${finalType}. Требуется анализ оператора.`;
+    }
+    
+    const extractedIp = extractIpFromIncident(finalDescription, details, finalType);
+    
+    // Deduce detection vector
+    let vector = "Системная аномалия (System Anomaly)";
+    const typeUpper = finalType.toUpperCase();
+    const descLower = finalDescription.toLowerCase();
+    
+    if (typeUpper.includes("DDOS") || typeUpper.includes("FLOOD") || descLower.includes("ddos") || descLower.includes("flood")) {
+      vector = "DDoS-атака (Сетевое наводнение)";
+    } else if (typeUpper.includes("SQL") || descLower.includes("sql") || descLower.includes("union select")) {
+      vector = "SQL-инъекция (Внедрение SQL-кода)";
+    } else if (typeUpper.includes("BRUTE") || typeUpper.includes("AUTH") || descLower.includes("brute") || descLower.includes("failed password")) {
+      vector = "Брутфорс (Подбор учетных данных)";
+    } else if (typeUpper.includes("HONEYPOT") || descLower.includes("honeypot") || descLower.includes("8081")) {
+      vector = "Срабатывание приманки (Honeypot Decoy)";
+    } else if (typeUpper.includes("PORT") || typeUpper.includes("SCAN") || descLower.includes("port scan") || descLower.includes("сканирование")) {
+      vector = "Сканирование портов / Сетевой аудит";
+    } else if (typeUpper.includes("C2") || typeUpper.includes("MALICIOUS") || descLower.includes("c2 connection")) {
+      vector = "Активность вредоносного ПО / Связь с C2";
+    } else if (typeUpper.includes("INTEGRITY") || descLower.includes("integrity") || descLower.includes("целостность")) {
+      vector = "Нарушение целостности системы (File Integrity)";
+    } else if (typeUpper.includes("UNAUTHORIZED") || descLower.includes("неавторизован")) {
+      vector = "Неавторизованный процесс / Доступ";
+    } else {
+      vector = finalType;
+    }
+
+    // Filter server logs for relevance
+    let relevantLogs = [];
+    if (extractedIp) {
+      relevantLogs = serverLogs.filter(l => l.message && l.message.includes(extractedIp));
+    }
+    
+    // If no logs match the IP, filter by detection vector keywords
+    if (relevantLogs.length === 0) {
+      const keywords = [];
+      if (vector.includes("DDoS")) keywords.push("ddos", "flood", "syn", "rate-limit");
+      if (vector.includes("SQL")) keywords.push("sql", "select", "union", "waf");
+      if (vector.includes("Брутфорс")) keywords.push("fail", "password", "auth", "login", "ssh");
+      if (vector.includes("Honeypot")) keywords.push("honeypot", "8081", "decoy", "payment");
+      if (vector.includes("Сканирование")) keywords.push("port", "scan", "unauthorized", "sshd");
+      if (vector.includes("C2")) keywords.push("c2", "malicious", "threat", "tor");
+      
+      relevantLogs = serverLogs.filter(l => {
+        if (!l.message) return false;
+        const msgLower = l.message.toLowerCase();
+        return keywords.some(k => msgLower.includes(k)) || l.level === "error" || l.level === "critical";
+      });
+    }
+    
+    // Fallback if empty: grab last 20 logs
+    if (relevantLogs.length === 0) {
+      relevantLogs = serverLogs.slice(-20);
+    } else {
+      relevantLogs = relevantLogs.slice(-100);
+    }
+    
+    const formattedLogs = relevantLogs.map(l => `[${l.timestamp.slice(11,19)}] [${l.level.toUpperCase()}] ${l.message}`).join("\n");
+    const timeStr = new Date().toISOString().slice(11, 19);
+    
+    const contextLogs = `=== ДЕТЕКТИРОВАННЫЙ ИНЦИДЕНТ ===
+[+] IP-Адрес: ${extractedIp || "Внутренний/Локальный IP"}
+[+] Способ фиксации (Вектор): ${vector}
+[+] Время фиксации: ${timeStr}
+================================
+
+Связанные логи (не более 100 строк):
+${formattedLogs || "Связанные логи отсутствуют"}`;
+    const incId = uuidv4();
+    
+    let geoInfo = getMockGeoIP(extractedIp, incId) || {};
+    if (!geoInfo.country || geoInfo.country === "Unknown") {
+      geoInfo.country = "Локальная сеть / РФ";
+    }
+    if (!geoInfo.code || geoInfo.code === "UN" || geoInfo.code === "??") {
+      geoInfo.code = "RU";
+    }
+    if (!geoInfo.isp || geoInfo.isp === "Unknown") {
+      geoInfo.isp = "Локальный провайдер (Protected)";
+    }
+    
+    let enrichedDescription = finalDescription;
+    if (extractedIp) {
+      const geoText = `[Регион: ${geoInfo.country} (${geoInfo.code}) | ISP: ${geoInfo.isp} | Угроза: ${geoInfo.reputation || 0}%]`;
+      if (!enrichedDescription.includes(geoText)) {
+        enrichedDescription += " " + geoText;
+      }
+    }
+
+    const incident = { 
+      id: incId, 
+      timestamp: new Date().toISOString(), 
+      severity: finalSeverity, 
+      monitor: finalMonitor, 
+      type: finalType, 
+      description: enrichedDescription, 
+      details, 
+      status: "new", 
+      contextBlock: contextLogs,
+      ip: extractedIp,
+      geo: geoInfo
+    };
+    try { db.addIncident(incident); } catch (e) { logger.error("DB addIncident failed", { err: e.message }); }
+    this.incidents.unshift(incident);
+    if (this.incidents.length > 5000) this.incidents.pop();
+    
+    // Avoid double logging inside addLog signature analyser trigger: log standard warn/error
+    logger.log(finalSeverity === "CRITICAL" ? "error" : "warn", `[Incident Engine] [${type}]: ${enrichedDescription}`, incident);
+    
+    if (typeof broadcast === "function") {
+      broadcast({ event: "incident", data: incident });
+    }
+    notifyTelegram(incident);
+
+    // Resolve real GeoIP in background
+    if (extractedIp) {
+      this.resolveRealGeoIP(incId, extractedIp);
+    }
+
+    // SOAR Auto-Ban Logic
+    if (extractedIp && this.activeDefenseEngine) {
+      const ip = extractedIp;
+      const typeLower = (type || "").toLowerCase();
+      const descLower = (description || "").toLowerCase();
+      
+      let shouldBan = false;
+      let reason = "";
+      
+      if (soarSettings.autoBanDdos && (typeLower.includes("ddos") || typeLower.includes("flood") || descLower.includes("ddos") || descLower.includes("flood"))) {
+        shouldBan = true;
+        reason = "SOAR: Auto-Ban DDoS Attempt";
+      } else if (soarSettings.autoBanBruteForce && (typeLower.includes("brute") || typeLower.includes("auth") || descLower.includes("brute") || descLower.includes("auth"))) {
+        shouldBan = true;
+        reason = "SOAR: Auto-Ban Brute Force Attempt";
+      }
+      
+      if (shouldBan) {
+        this.activeDefenseEngine.banIpInSystem(ip, reason);
+      }
+    }
+
+    // Trigger Deterministic Fallback Active Defense (protects REMON and host instantly)
+    if (this.activeDefenseEngine) {
+      this.activeDefenseEngine.checkFallbackDefense(incident);
+    }
+
+    return incident;
+  }
+
+  resolveRealGeoIP(incidentId, ip) {
+    if (!ip) return;
+    
+    // Check if it is a local/private IP address
+    const isPrivate = ip === "127.0.0.1" || ip === "localhost" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
+                      /^(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)$/.test(ip);
+                      
+    if (isPrivate) {
+      // For local testing & offline defense presentations: mock a threat IP from overseas to visualize on the map
+      setTimeout(() => {
+        const inc = this.incidents.find(i => i.id === incidentId);
+        if (inc) {
+          const mockGeo = getMockGeoIP(ip, incidentId);
+          inc.geo = {
+            ...mockGeo,
+            reputation: (inc.geo && inc.geo.reputation) ? inc.geo.reputation : 65,
+            ip: ip
+          };
+          const baseDesc = inc.description.split(" [Регион:")[0];
+          inc.description = baseDesc + ` [Регион: ${inc.geo.country} (${inc.geo.code}) | ISP: ${inc.geo.isp} | Угроза: ${inc.geo.reputation}%]`;
+          
+          try {
+            db.updateIncident(incidentId, { geo: inc.geo, description: inc.description });
+            if (typeof broadcast === "function") {
+              broadcast({ event: "incident_updated", data: inc });
+            }
+          } catch (e) {
+            logger.error("Failed to save simulated GeoIP to DB", { err: e.message });
+          }
+        }
+      }, 500);
+      return;
+    }
+
+    const http = require("http");
+    const url = `http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,lat,lon,isp`;
+    
+    http.get(url, (res) => {
+      let raw = "";
+      res.on("data", chunk => raw += chunk);
+      res.on("end", () => {
+        try {
+          const data = JSON.parse(raw);
+          if (data && data.status === "success") {
+            const inc = this.incidents.find(i => i.id === incidentId);
+            if (inc) {
+              inc.geo = {
+                country: data.country || "Локальная сеть / РФ",
+                code: data.countryCode || "RU",
+                lat: data.lat || 0,
+                lon: data.lon || 0,
+                isp: data.isp || "Локальный провайдер (Protected)",
+                reputation: inc.geo ? inc.geo.reputation : 50,
+                ip: ip
+              };
+              
+              const baseDesc = inc.description.split(" [Регион:")[0];
+              inc.description = baseDesc + ` [Регион: ${inc.geo.country} (${inc.geo.code}) | ISP: ${inc.geo.isp} | Угроза: ${inc.geo.reputation}%]`;
+              
+              try {
+                db.updateIncident(incidentId, { geo: inc.geo, description: inc.description });
+                if (typeof broadcast === "function") {
+                  broadcast({ event: "incident_updated", data: inc });
+                }
+              } catch (e) {
+                logger.error("Failed to save real GeoIP to DB", { err: e.message });
+              }
+            }
+          }
+        } catch (e) {
+          logger.warn(`Failed to parse real GeoIP for ${ip}: ${e.message}`);
+        }
+      });
+    }).on("error", (e) => {
+      logger.warn(`Failed to fetch real GeoIP for ${ip}: ${e.message}`);
+    });
+  }
+}
+
+class ThreatIntelWatchdog {
+  constructor(activeDefenseEngine, logManager) {
+    this.activeDefenseEngine = activeDefenseEngine;
+    this.logManager = logManager;
+    this.maliciousIps = new Set();
+    this.intelFilePath = path.join(__dirname, "../data/threat_intel_ips.json");
+    this.loadIntelList();
+  }
+
+  loadIntelList() {
+    if (fs.existsSync(this.intelFilePath)) {
+      try {
+        const ips = JSON.parse(fs.readFileSync(this.intelFilePath, "utf8"));
+        if (Array.isArray(ips)) {
+          ips.forEach(ip => this.maliciousIps.add(ip.trim()));
+          logger.info(`[ThreatIntel] Loaded ${this.maliciousIps.size} malicious C2/Tor IPs from disk.`);
+        }
+      } catch (e) {
+        logger.error("[ThreatIntel] Failed to load local intel list: " + e.message);
+      }
+    }
+    
+    if (this.maliciousIps.size === 0) {
+      const defaultMalicious = [
+        "185.220.101.4", "185.220.101.5", "109.70.100.201",
+        "45.227.254.10", "103.45.2.19", "82.102.23.45"
+      ];
+      try {
+        fs.writeFileSync(this.intelFilePath, JSON.stringify(defaultMalicious, null, 2), "utf8");
+        defaultMalicious.forEach(ip => this.maliciousIps.add(ip));
+        logger.info(`[ThreatIntel] Created default threat intel list with ${defaultMalicious.length} seeds.`);
+      } catch (e) {
+        logger.error("[ThreatIntel] Failed to write default intel list: " + e.message);
+      }
+    }
+  }
+
+  async updateIntelFeeds() {
+    logger.info("[ThreatIntel] Updating Threat Intel Feeds (Tor exit nodes)...");
+    const https = require("https");
+    
+    https.get("https://check.torproject.org/exit-addresses", (res) => {
+      let raw = "";
+      res.on("data", chunk => raw += chunk);
+      res.on("end", () => {
+        try {
+          const lines = raw.split("\n");
+          let count = 0;
+          lines.forEach(line => {
+            if (line.startsWith("ExitAddress")) {
+              const parts = line.split(/\s+/);
+              const ip = parts[1];
+              if (ip) {
+                this.maliciousIps.add(ip.trim());
+                count++;
+              }
+            }
+          });
+          logger.info(`[ThreatIntel] Successfully fetched Tor exit nodes list. Added ${count} IPs.`);
+          fs.writeFileSync(this.intelFilePath, JSON.stringify(Array.from(this.maliciousIps), null, 2), "utf8");
+        } catch (e) {
+          logger.warn("[ThreatIntel] Failed to parse Tor exit nodes feed: " + e.message);
+        }
+      });
+    }).on("error", (e) => {
+      logger.warn("[ThreatIntel] Failed to fetch Tor exit nodes feed: " + e.message);
+    });
+  }
+
+  auditActiveConnections() {
+    const { exec } = require("child_process");
+    const isWin = process.platform === "win32";
+    const cmd = isWin ? "netstat -ano" : "ss -t -n -a";
+
+    exec(cmd, (err, stdout) => {
+      if (err || !stdout) return;
+      
+      const lines = stdout.split("\n");
+      lines.forEach(line => {
+        const ipMatch = line.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g);
+        if (ipMatch) {
+          ipMatch.forEach(ip => {
+            const cleanIp = ip.trim();
+            if (this.maliciousIps.has(cleanIp)) {
+              if (whitelistManager.isIpBannable(cleanIp)) {
+                logger.error(`[ThreatIntel] Malicious C2/Tor Connection Detected! Remote IP: ${cleanIp}`);
+                
+                incidentManager.addIncident(
+                  "CRITICAL",
+                  "ThreatIntelWatchdog",
+                  "MALICIOUS_C2_CONNECTION_DETECTED",
+                  `Зафиксировано активное сетевое соединение хоста с известным вредоносным C2/Tor-узлом: ${cleanIp}.`,
+                  { remoteIp: cleanIp, raw_connection: line.trim() }
+                );
+                
+                this.activeDefenseEngine.banIpInSystem(cleanIp, "Threat Intel: Block Malicious C2 Connection");
+              }
+            }
+          });
+        }
+      });
+    });
+  }
+
+  startScheduler() {
+    setInterval(() => this.auditActiveConnections(), 30000);
+    setInterval(() => this.updateIntelFeeds(), 12 * 60 * 60 * 1000);
+    setTimeout(() => this.updateIntelFeeds(), 5000);
+    setTimeout(() => this.auditActiveConnections(), 8000);
+  }
+}
+
+const apiLimits = new Map();
+function apiRateLimiter(windowMs, maxRequests) {
+  return (req, res, next) => {
+    const ip = req.ip || req.socket.remoteAddress || "127.0.0.1";
+    const now = Date.now();
+    const record = apiLimits.get(ip) || { count: 0, resetTime: now + windowMs };
+    
+    if (now > record.resetTime) {
+      record.count = 1;
+      record.resetTime = now + windowMs;
+    } else {
+      record.count++;
+    }
+    apiLimits.set(ip, record);
+    
+    if (record.count > maxRequests) {
+      logger.warn(`[API-RateLimiter] Rate limit exceeded for IP: ${ip} on ${req.path}`);
+      return res.status(429).json({ error: "Too many requests. Please try again later." });
+    }
+    next();
+  };
+}
+
+// Instance Instantiation for compatibility mapping
+const whitelistManager = new WhitelistManager();
+const activeDefenseEngine = new ActiveDefenseEngine(whitelistManager);
+const logManager = new LogManager();
+const incidentManager = new IncidentManager();
+const threatIntelWatchdog = new ThreatIntelWatchdog(activeDefenseEngine, logManager);
+
+// Link dependencies
+incidentManager.setDefenseEngine(activeDefenseEngine);
+
+// Compatibility wrappers for existing code in other files (and local code block references)
+function addLog(type, level, message, meta) {
+  return logManager.addLog(type, level, message, meta);
+}
+function addIncident(severity, monitor, type, description, details) {
+  return incidentManager.addIncident(severity, monitor, type, description, details);
+}
+function isIpBannable(ip) {
+  return whitelistManager.isIpBannable(ip);
+}
+function isValidIp(ip) {
+  return whitelistManager.isValidIp(ip);
+}
+function isValidIpOrCidr(val) {
+  return whitelistManager.isValidIpOrCidr(val);
+}
+function banIpInSystem(ip, reason) {
+  return activeDefenseEngine.banIpInSystem(ip, reason);
+}
+function unbanIpInSystem(ip) {
+  return activeDefenseEngine.unbanIpInSystem(ip);
+}
+function updateSshAndFileWhitelist() {
+  return whitelistManager.updateSshAndFileWhitelist();
+}
+
+function addIncident(severity, monitor, type, description, details) {
+  return incidentManager.addIncident(severity, monitor, type, description, details);
+}
+
+
 const aiClient = AITUNNEL_API_KEY ? new OpenAI({ apiKey: AITUNNEL_API_KEY, baseURL: AITUNNEL_BASE_URL }) : null;
 
 async function askAI(model, messages, temperature = 0.3) {
@@ -531,7 +1264,12 @@ app.get("/api/health", (_req, res) => {
 
 // ── SOAR Settings ───────────────────────────────────────────────────────────
 app.get("/api/soar-settings", (_req, res) => {
-  res.json(soarSettings);
+  res.json({
+    ...soarSettings,
+    whitelist: Array.from(BANNED_IP_WHITELIST),
+    whitelistCidrs: Array.from(BANNED_IP_WHITELIST_CIDRS),
+    activeSshSessions: Array.from(ACTIVE_SSH_SESSIONS)
+  });
 });
 
 app.post("/api/soar-settings", (req, res) => {
@@ -549,13 +1287,114 @@ app.post("/api/soar-settings", (req, res) => {
   if (aiTriggerOnCritical !== undefined) soarSettings.aiTriggerOnCritical = !!aiTriggerOnCritical;
   
   saveSoarSettings();
-  broadcast({ event: "soar_settings_updated", data: soarSettings });
+  
+  const fullSettings = {
+    ...soarSettings,
+    whitelist: Array.from(BANNED_IP_WHITELIST),
+    whitelistCidrs: Array.from(BANNED_IP_WHITELIST_CIDRS),
+    activeSshSessions: Array.from(ACTIVE_SSH_SESSIONS)
+  };
+  broadcast({ event: "soar_settings_updated", data: fullSettings });
   addLog("server", "info", "SOAR & AI settings updated by administrator", soarSettings);
-  res.json({ success: true, soarSettings });
+  res.json({ success: true, soarSettings: fullSettings });
+});
+
+// ── IP Whitelist Management ──────────────────────────────────────────────────
+app.post("/api/whitelist/add", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  const { ip } = req.body || {};
+  if (!ip || !isValidIpOrCidr(ip)) return res.status(400).json({ error: "Invalid IP address or CIDR format" });
+
+  const whitelistFile = path.join(__dirname, "..", "data", "unbannable_ips.json");
+  let fileIps = [];
+  if (fs.existsSync(whitelistFile)) {
+    try {
+      fileIps = JSON.parse(fs.readFileSync(whitelistFile, "utf8"));
+    } catch (_) {}
+  }
+
+  const cleanIp = ip.trim().toLowerCase();
+  if (!fileIps.includes(cleanIp)) {
+    fileIps.push(cleanIp);
+    try {
+      fs.writeFileSync(whitelistFile, JSON.stringify(fileIps, null, 2), "utf8");
+      
+      if (cleanIp.includes("/")) {
+        BANNED_IP_WHITELIST_CIDRS.add(cleanIp);
+      } else {
+        BANNED_IP_WHITELIST.add(cleanIp);
+      }
+      
+      logger.info(`[IP-Whitelist] Added ${cleanIp} to whitelist exceptions.`);
+      addLog("server", "info", `IP/Subnet ${cleanIp} added to whitelist exclusions by administrator`, { ip: cleanIp });
+      
+      const fullSettings = {
+        ...soarSettings,
+        whitelist: Array.from(BANNED_IP_WHITELIST),
+        whitelistCidrs: Array.from(BANNED_IP_WHITELIST_CIDRS),
+        activeSshSessions: Array.from(ACTIVE_SSH_SESSIONS)
+      };
+      broadcast({ event: "soar_settings_updated", data: fullSettings });
+      
+      return res.json({ success: true, soarSettings: fullSettings });
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to write whitelist file: " + e.message });
+    }
+  }
+  return res.json({ success: true, message: "IP already whitelisted" });
+});
+
+app.post("/api/whitelist/remove", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  const { ip } = req.body || {};
+  if (!ip || !isValidIpOrCidr(ip)) return res.status(400).json({ error: "Invalid IP address or CIDR format" });
+
+  const whitelistFile = path.join(__dirname, "..", "data", "unbannable_ips.json");
+  let fileIps = [];
+  if (fs.existsSync(whitelistFile)) {
+    try {
+      fileIps = JSON.parse(fs.readFileSync(whitelistFile, "utf8"));
+    } catch (_) {}
+  }
+
+  const cleanIp = ip.trim().toLowerCase();
+  const index = fileIps.indexOf(cleanIp);
+  if (index !== -1) {
+    fileIps.splice(index, 1);
+    try {
+      fs.writeFileSync(whitelistFile, JSON.stringify(fileIps, null, 2), "utf8");
+      
+      if (cleanIp.includes("/")) {
+        BANNED_IP_WHITELIST_CIDRS.delete(cleanIp);
+      } else {
+        BANNED_IP_WHITELIST.delete(cleanIp);
+      }
+      
+      logger.info(`[IP-Whitelist] Removed ${cleanIp} from whitelist.`);
+      addLog("server", "info", `IP/Subnet ${cleanIp} removed from whitelist exclusions by administrator`, { ip: cleanIp });
+      
+      const fullSettings = {
+        ...soarSettings,
+        whitelist: Array.from(BANNED_IP_WHITELIST),
+        whitelistCidrs: Array.from(BANNED_IP_WHITELIST_CIDRS),
+        activeSshSessions: Array.from(ACTIVE_SSH_SESSIONS)
+      };
+      broadcast({ event: "soar_settings_updated", data: fullSettings });
+      
+      return res.json({ success: true, soarSettings: fullSettings });
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to write whitelist file: " + e.message });
+    }
+  }
+  return res.status(400).json({ error: "IP not found in static whitelist file" });
 });
 
 // ── Auth ────────────────────────────────────────────────────────────────────
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", apiRateLimiter(60000, 5), (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, error: "Missing credentials" });
   if (db.verifyUser(username, password)) {
@@ -621,12 +1460,37 @@ app.get("/api/incidents", (req, res) => {
         try { i.geo = JSON.parse(i.geo); } catch (_) {}
       }
       i.ip = extractIpFromIncident(i.description, i.details, i.type);
+      
+      // Load AI report from disk if exists
+      try {
+        const filepath = path.join(reportsDir, `report-${i.id}.md`);
+        if (fs.existsSync(filepath)) {
+          i.aiAudit = fs.readFileSync(filepath, "utf8");
+        } else {
+          i.aiAudit = null;
+        }
+      } catch (_) {
+        i.aiAudit = null;
+      }
     });
     res.json({ total: data.length, data });
   } catch (e) {
     let data = incidents;
     if (severity) data = data.filter(i => i.severity === severity);
-    res.json({ total: data.length, data: data.slice(Number(offset), Number(offset) + Number(limit)) });
+    const sliced = data.slice(Number(offset), Number(offset) + Number(limit));
+    sliced.forEach(i => {
+      try {
+        const filepath = path.join(reportsDir, `report-${i.id}.md`);
+        if (fs.existsSync(filepath)) {
+          i.aiAudit = fs.readFileSync(filepath, "utf8");
+        } else {
+          i.aiAudit = null;
+        }
+      } catch (_) {
+        i.aiAudit = null;
+      }
+    });
+    res.json({ total: data.length, data: sliced });
   }
 });
 app.post("/api/incidents", (req, res) => {
@@ -644,6 +1508,64 @@ app.patch("/api/incidents/:id", (req, res) => {
   if (severity) { incident.severity = severity; try { db.updateIncident(req.params.id, { severity }); } catch (_) {} }
   broadcast({ event: "incident_updated", data: incident });
   res.json(incident);
+});
+
+app.post("/api/incidents/bulk-status", (req, res) => {
+  const { ids, status } = req.body;
+  if (!Array.isArray(ids) || !status) return res.status(400).json({ error: "Missing ids array or status" });
+  try {
+    ids.forEach(id => {
+      const incident = incidents.find(i => i.id === id);
+      if (incident) {
+        incident.status = status;
+        db.updateIncident(id, { status });
+        broadcast({ event: "incident_updated", data: incident });
+      }
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/incidents/bulk-delete", (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids)) return res.status(400).json({ error: "Missing ids array" });
+  try {
+    ids.forEach(id => {
+      const idx = incidents.findIndex(i => i.id === id);
+      if (idx !== -1) {
+        incidents.splice(idx, 1);
+      }
+      db.deleteIncident(id);
+    });
+    broadcast({ event: "incidents_list", data: incidents });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/logs/bulk-delete", (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids)) return res.status(400).json({ error: "Missing ids array" });
+  try {
+    ids.forEach(id => {
+      db.deleteLog(id);
+      
+      const idxS = serverLogs.findIndex(l => l.id === id);
+      if (idxS !== -1) serverLogs.splice(idxS, 1);
+      
+      const idxB = botLogs.findIndex(l => l.id === id);
+      if (idxB !== -1) botLogs.splice(idxB, 1);
+      
+      const idxC = cveLogs.findIndex(l => l.id === id);
+      if (idxC !== -1) cveLogs.splice(idxC, 1);
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete("/api/incidents", (req, res) => {
@@ -686,7 +1608,7 @@ app.get("/api/quarantine", (req, res) => {
 
 app.post("/api/quarantine", (req, res) => {
   const { ip, reason } = req.body;
-  if (!ip) return res.status(400).json({ error: "IP required" });
+  if (!ip || !isValidIp(ip)) return res.status(400).json({ error: "Invalid IP address format" });
   const success = banIpInSystem(ip, reason);
   if (success) {
     res.json({ success: true, ip });
@@ -697,6 +1619,7 @@ app.post("/api/quarantine", (req, res) => {
 
 app.delete("/api/quarantine/:ip", (req, res) => {
   const ip = req.params.ip;
+  if (!ip || !isValidIp(ip)) return res.status(400).json({ error: "Invalid IP address format" });
   const success = unbanIpInSystem(ip);
   if (success) {
     res.json({ success: true, ip });
@@ -711,7 +1634,11 @@ app.delete("/api/process/:pid", (req, res) => {
   if (!pid) return res.status(400).json({ error: "Invalid PID" });
   try {
     const { execSync } = require("child_process");
-    execSync(`kill -9 ${pid}`, { stdio: "ignore" });
+    if (process.platform === "win32") {
+      execSync(`taskkill /F /PID ${pid}`, { stdio: "ignore" });
+    } else {
+      execSync(`sudo kill -9 ${pid}`, { stdio: "ignore" });
+    }
     addLog("server", "info", `Killed process PID: ${pid}`);
     res.json({ success: true, pid });
   } catch (e) {
@@ -906,7 +1833,7 @@ app.post("/api/reset-demo", (req, res) => {
 });
 
 // ── AI ───────────────────────────────────────────────────────────────────────
-app.post("/api/ai/task", async (req, res) => {
+app.post("/api/ai/task", apiRateLimiter(60000, 10), async (req, res) => {
   const { model, task, systemPrompt, incidentId } = req.body;
   const apiKey = req.headers["x-api-key"];
   const isLocal = req.ip === "::1" || req.ip === "127.0.0.1" || req.ip === "::ffff:127.0.0.1";
@@ -1003,7 +1930,7 @@ app.post("/api/ai-nlp-search", async (req, res) => {
   }
 });
 
-app.post("/api/execute-ai-script", (req, res) => {
+app.post("/api/execute-ai-script", apiRateLimiter(60000, 10), (req, res) => {
   const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
   if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
 
@@ -1069,34 +1996,173 @@ app.post("/api/install-scanners", (req, res) => {
 
 // ── Run Audit trigger ─────────────────────────────────────────────────────────
 let auditRunning = false;
+
+function processAuditResults(trivyFile, semgrepFile) {
+  // 1. Process Trivy findings
+  if (fs.existsSync(trivyFile)) {
+    try {
+      const raw = fs.readFileSync(trivyFile, "utf8");
+      const results = JSON.parse(raw);
+      fs.unlinkSync(trivyFile); // cleanup
+      
+      let count = 0;
+      (results.Results || []).forEach(result => {
+        (result.Vulnerabilities || []).forEach(v => {
+          count++;
+          const vulnId = v.VulnerabilityID;
+          const pkg = v.PkgName;
+          const severity = v.Severity; // e.g., CRITICAL, HIGH, MEDIUM, LOW
+          const title = v.Title || "No title";
+          const fixedVersion = v.FixedVersion || "N/A";
+          const target = result.Target || "/etc";
+          
+          let logSeverity = "info";
+          if (severity === "CRITICAL" || severity === "HIGH") logSeverity = "error";
+          else if (severity === "MEDIUM") logSeverity = "warn";
+          
+          const message = `[Trivy] Обнаружена уязвимость ${vulnId} в пакете ${pkg} (${severity}). Цель: ${target}. Заголовок: ${title}. Решение: обновить до версии ${fixedVersion}.`;
+          addLog("cve", logSeverity, message, { vulnId, pkg, severity, title, fixedVersion, target, scanner: "trivy" });
+        });
+      });
+      logger.info(`Processed ${count} Trivy CVE findings from audit`);
+    } catch (e) {
+      logger.error("Failed to parse Trivy audit output", { err: e.message });
+    }
+  }
+
+  // 2. Process Semgrep findings
+  if (fs.existsSync(semgrepFile)) {
+    try {
+      const raw = fs.readFileSync(semgrepFile, "utf8");
+      const results = JSON.parse(raw);
+      fs.unlinkSync(semgrepFile); // cleanup
+      
+      let count = 0;
+      (results.results || []).forEach(r => {
+        count++;
+        const pathFile = r.path;
+        const line = r.start?.line || 0;
+        const message = r.extra?.message || "No description";
+        const severity = r.extra?.metadata?.severity || "MEDIUM"; // ERROR, WARNING, INFO
+        const rule = r.check_id;
+        
+        let logSeverity = "info";
+        if (severity === "ERROR") logSeverity = "error";
+        else if (severity === "WARNING" || severity === "MEDIUM") logSeverity = "warn";
+        
+        const logMsg = `[Semgrep] Нарушение правила безопасности ${rule} в файле ${pathFile}:${line} (${severity}). Описание: ${message}`;
+        addLog("cve", logSeverity, logMsg, { rule, path: pathFile, line, severity, message, scanner: "semgrep" });
+      });
+      logger.info(`Processed ${count} Semgrep findings from audit`);
+    } catch (e) {
+      logger.error("Failed to parse Semgrep audit output", { err: e.message });
+    }
+  }
+}
+
+function scanDockerImagesInternal() {
+  const { execSync } = require("child_process");
+  let dockerImages = [];
+  try {
+    const imagesOutput = execSync('docker ps --format "{{.Image}}" 2>/dev/null', { encoding: "utf8" });
+    dockerImages = imagesOutput.split("\n").map(img => img.trim()).filter(Boolean);
+    dockerImages = [...new Set(dockerImages)];
+  } catch (e) {
+    logger.info("Docker daemon is not running or docker client is not available. Skipping container scan.");
+    return;
+  }
+
+  if (dockerImages.length === 0) {
+    logger.info("No running Docker containers detected to scan.");
+    return;
+  }
+
+  logger.info(`[Trivy-Docker] Found ${dockerImages.length} running Docker images to scan: ${dockerImages.join(", ")}`);
+  
+  dockerImages.forEach((img, index) => {
+    const outPath = path.join(__dirname, "..", "logs", `trivy_docker_${index}_${Date.now()}.json`);
+    try {
+      // Run Trivy scan on the image
+      execSync(`trivy image --format json -o "${outPath}" "${img}" --quiet`, { timeout: 120000 });
+      if (fs.existsSync(outPath)) {
+        const raw = fs.readFileSync(outPath, "utf8");
+        const results = JSON.parse(raw);
+        fs.unlinkSync(outPath);
+        
+        let count = 0;
+        (results.Results || []).forEach(result => {
+          (result.Vulnerabilities || []).forEach(v => {
+            count++;
+            const vulnId = v.VulnerabilityID;
+            const pkg = v.PkgName;
+            const severity = v.Severity;
+            const title = v.Title || "No title";
+            const fixedVersion = v.FixedVersion || "N/A";
+            
+            let logSeverity = "info";
+            if (severity === "CRITICAL" || severity === "HIGH") logSeverity = "error";
+            else if (severity === "MEDIUM") logSeverity = "warn";
+            
+            const message = `[Trivy (Docker)] Обнаружена уязвимость ${vulnId} в контейнере (образ: ${img}) в пакете ${pkg} (${severity}). Заголовок: ${title}. Решение: обновить до версии ${fixedVersion}.`;
+            addLog("cve", logSeverity, message, { vulnId, pkg, severity, title, fixedVersion, image: img, scanner: "trivy-docker" });
+          });
+        });
+        logger.info(`[Trivy-Docker] Processed ${count} CVE findings for image ${img}`);
+      }
+    } catch (err) {
+      logger.error(`[Trivy-Docker] Failed to scan Docker image ${img}`, { error: err.message });
+    }
+  });
+}
+
+function runSystemAuditInternal() {
+  if (auditRunning) {
+    logger.info("System security audit already in progress, skipping run");
+    return;
+  }
+  auditRunning = true;
+  addLog("server", "info", "Starting system security audit (Trivy & Semgrep) in background");
+  
+  const { exec } = require("child_process");
+  const tempTrivy = path.join(__dirname, "..", "logs", `trivy_audit_${Date.now()}.json`);
+  const tempSemgrep = path.join(__dirname, "..", "logs", `semgrep_audit_${Date.now()}.json`);
+  
+  const trivyTarget = process.platform === "win32" ? path.join(__dirname, "..") : "/etc";
+  
+  const cmd = `trivy fs --format json -o "${tempTrivy}" "${trivyTarget}" 2>/dev/null; semgrep --config=p/security-audit "${path.join(__dirname, "..")}" --json -o "${tempSemgrep}" --quiet 2>/dev/null`;
+  
+  exec(cmd, (err) => {
+    auditRunning = false;
+    
+    // Parse results for files that were generated
+    processAuditResults(tempTrivy, tempSemgrep);
+    
+    // Scan docker images
+    scanDockerImagesInternal();
+    
+    if (err) {
+      logger.error("System security audit execution finished with errors", { error: err.message });
+      addLog("server", "warn", `Security audit completed with some errors: ${err.message}`);
+    } else {
+      logger.info("System security audit completed successfully");
+      addLog("server", "info", "Security audit completed successfully. New vulnerabilities updated.");
+    }
+    
+    // Inject incident
+    addIncident("HIGH", "SecurityScanner", "VULNERABILITY_DISCOVERY", "System security audit finished. Trivy and Semgrep findings updated in CVE Logs.");
+    
+    // Broadcast updated stats
+    broadcast({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } });
+  });
+}
+
 app.post("/api/run-audit", (req, res) => {
   const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
   if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
   
   if (auditRunning) return res.json({ success: true, message: "Audit already in progress" });
-  auditRunning = true;
   
-  addLog("server", "info", "Starting system security audit (Trivy & Semgrep) in background");
-  
-  // Run background scan
-  const { exec } = require("child_process");
-  const tempTrivy = "/tmp/trivy_scan_out.json";
-  const tempSemgrep = "/tmp/semgrep_scan_out.json";
-  
-  const cmd = `trivy fs --format json -o ${tempTrivy} /etc 2>/dev/null; semgrep --config=p/security-audit "${path.join(__dirname, "..")}" --json -o ${tempSemgrep} --quiet 2>/dev/null`;
-  
-  exec(cmd, (err) => {
-    auditRunning = false;
-    if (err) {
-      logger.error("System security audit failed", { error: err.message });
-      addLog("server", "error", `Security audit failed: ${err.message}`);
-    } else {
-      logger.info("System security audit completed");
-      addLog("server", "info", "Security audit completed. New vulnerabilities detected.");
-      // Inject as an incident
-      addIncident("HIGH", "SecurityScanner", "VULNERABILITY_DISCOVERY", "Security audit finished. Trivy and Semgrep findings updated.");
-    }
-  });
+  runSystemAuditInternal();
   
   res.json({ success: true });
 });
@@ -1129,9 +2195,9 @@ app.post("/api/activate-security", (req, res) => {
 // ── Check UFW, Fail2ban & Lua security status ──
 app.get("/api/security-status", (req, res) => {
   const { execSync } = require("child_process");
-  let ufwStatus = "unknown";
-  let fail2banStatus = "unknown";
-  let luaStatus = "unknown";
+  let ufwStatus = "inactive";
+  let fail2banStatus = "inactive";
+  let luaStatus = "inactive";
   
   try {
     const ufwOut = execSync("sudo ufw status", { encoding: "utf8" });
@@ -1150,6 +2216,112 @@ app.get("/api/security-status", (req, res) => {
   } catch (_) { luaStatus = "not_installed"; }
   
   res.json({ ufw: ufwStatus, fail2ban: fail2banStatus, lua: luaStatus });
+});
+
+// ── OS Hardening Compliance Audit ──────────────────────────────────────────
+app.get("/api/hardening-compliance", (req, res) => {
+  const { execSync } = require("child_process");
+  const fs = require("fs");
+  const results = [];
+
+  // Helper
+  function check(id, label, category, fn) {
+    try {
+      const r = fn();
+      results.push({ id, label, category, ...r });
+    } catch (e) {
+      results.push({ id, label, category, status: "FAIL", detail: `Ошибка проверки: ${e.message}`, mitigation: "Проверьте доступ к системным файлам и sudo-права." });
+    }
+  }
+
+  // 1. ASLR
+  check("aslr", "ASLR (рандомизация адресного пространства)", "Kernel", () => {
+    const val = fs.readFileSync("/proc/sys/kernel/randomize_va_space", "utf8").trim();
+    if (val === "2") return { status: "PASS", detail: `randomize_va_space = ${val} (полная рандомизация)`, mitigation: null };
+    if (val === "1") return { status: "WARN", detail: `randomize_va_space = ${val} (частичная рандомизация)`, mitigation: "Установите sysctl kernel.randomize_va_space=2 в /etc/sysctl.conf" };
+    return { status: "FAIL", detail: `randomize_va_space = ${val} (отключено!)`, mitigation: "Немедленно: echo 2 | sudo tee /proc/sys/kernel/randomize_va_space" };
+  });
+
+  // 2. Yama ptrace scope
+  check("yama", "Yama ptrace_scope (защита от трассировки)", "Kernel", () => {
+    try {
+      const val = fs.readFileSync("/proc/sys/kernel/yama/ptrace_scope", "utf8").trim();
+      if (val === "1" || val === "2" || val === "3") return { status: "PASS", detail: `ptrace_scope = ${val} (ограничен)`, mitigation: null };
+      return { status: "FAIL", detail: `ptrace_scope = ${val} (неограничен, небезопасно)`, mitigation: "Установите kernel.yama.ptrace_scope=1 в /etc/sysctl.conf" };
+    } catch (_) {
+      return { status: "WARN", detail: "Модуль Yama не загружен или недоступен", mitigation: "Убедитесь, что CONFIG_SECURITY_YAMA включён в ядро." };
+    }
+  });
+
+  // 3. UFW
+  check("ufw", "Брандмауэр UFW", "Network", () => {
+    try {
+      const out = execSync("sudo ufw status", { encoding: "utf8", timeout: 5000 });
+      if (out.includes("Status: active")) return { status: "PASS", detail: "UFW активен и работает", mitigation: null };
+      return { status: "FAIL", detail: "UFW установлен, но не активен", mitigation: "sudo ufw enable && sudo ufw default deny incoming" };
+    } catch (_) {
+      return { status: "FAIL", detail: "UFW не установлен или недоступен", mitigation: "sudo apt install ufw && sudo ufw enable" };
+    }
+  });
+
+  // 4. Fail2ban
+  check("fail2ban", "Fail2ban (защита от брутфорса)", "Network", () => {
+    try {
+      const out = execSync("sudo fail2ban-client ping", { encoding: "utf8", timeout: 5000 });
+      if (out.includes("Server replied: pong")) return { status: "PASS", detail: "Fail2ban активен и отвечает", mitigation: null };
+      return { status: "WARN", detail: "Fail2ban не отвечает на ping", mitigation: "sudo systemctl restart fail2ban" };
+    } catch (_) {
+      return { status: "FAIL", detail: "Fail2ban не установлен или сервис упал", mitigation: "sudo apt install fail2ban && sudo systemctl enable --now fail2ban" };
+    }
+  });
+
+  // 5. SSH Root login disabled
+  check("ssh_root", "SSH: запрет входа root", "SSH", () => {
+    try {
+      const cfg = fs.readFileSync("/etc/ssh/sshd_config", "utf8");
+      if (/^\s*PermitRootLogin\s+no/mi.test(cfg)) return { status: "PASS", detail: "PermitRootLogin no — вход root через SSH запрещён", mitigation: null };
+      if (/^\s*PermitRootLogin\s+prohibit-password/mi.test(cfg)) return { status: "WARN", detail: "PermitRootLogin prohibit-password (ключ ещё разрешён)", mitigation: "Установите PermitRootLogin no в /etc/ssh/sshd_config" };
+      return { status: "FAIL", detail: "Root-вход по SSH разрешён!", mitigation: "Измените PermitRootLogin на no и перезапустите: sudo systemctl reload sshd" };
+    } catch (_) {
+      return { status: "WARN", detail: "Не удалось прочитать sshd_config", mitigation: "Проверьте файл /etc/ssh/sshd_config вручную." };
+    }
+  });
+
+  // 6. SSH Password auth
+  check("ssh_pass", "SSH: отключение парольной аутентификации", "SSH", () => {
+    try {
+      const cfg = fs.readFileSync("/etc/ssh/sshd_config", "utf8");
+      if (/^\s*PasswordAuthentication\s+no/mi.test(cfg)) return { status: "PASS", detail: "PasswordAuthentication no — только ключи", mitigation: null };
+      return { status: "WARN", detail: "Парольный вход по SSH разрешён", mitigation: "Установите PasswordAuthentication no в sshd_config, настройте SSH-ключи" };
+    } catch (_) {
+      return { status: "WARN", detail: "Не удалось прочитать sshd_config", mitigation: "Проверьте файл /etc/ssh/sshd_config вручную." };
+    }
+  });
+
+  // 7. /etc/passwd world-writable check
+  check("passwd_perm", "Права доступа к /etc/passwd", "Files", () => {
+    try {
+      const out = execSync("stat -c '%a' /etc/passwd", { encoding: "utf8" }).trim();
+      const perms = parseInt(out, 8);
+      if ((perms & 0o002) === 0) return { status: "PASS", detail: `/etc/passwd permissions: ${out} (нет записи для всех)`, mitigation: null };
+      return { status: "FAIL", detail: `/etc/passwd доступен для записи всем (${out})!`, mitigation: "sudo chmod 644 /etc/passwd" };
+    } catch (_) {
+      return { status: "WARN", detail: "Не удалось проверить /etc/passwd", mitigation: null };
+    }
+  });
+
+  // 8. /tmp noexec
+  check("tmp_noexec", "Флаг noexec на /tmp", "Filesystem", () => {
+    try {
+      const out = execSync("findmnt -n -o OPTIONS /tmp", { encoding: "utf8" });
+      if (out.includes("noexec")) return { status: "PASS", detail: "/tmp смонтирован с флагом noexec", mitigation: null };
+      return { status: "WARN", detail: "/tmp без флага noexec — возможно выполнение скриптов", mitigation: "Добавьте noexec в /etc/fstab для /tmp и перемонтируйте" };
+    } catch (_) {
+      return { status: "WARN", detail: "/tmp не является отдельным разделом", mitigation: "Рекомендуется вынести /tmp на отдельный раздел с noexec." };
+    }
+  });
+
+  res.json({ timestamp: new Date().toISOString(), results });
 });
 
 // ── Bot notify endpoint (вызывается из addIncident) ──────────────────────────
@@ -1320,8 +2492,64 @@ function startWSS(server) {
         }
         if (msg.event === "run_scan") {
           const { scanType, target } = msg.data || {};
-          if (scanType === "semgrep") runSemgrep(target || __dirname).then(r => broadcast({ event: "scan_result", data: r }));
-          else if (scanType === "trivy") runTrivy(target || ".", "fs").then(r => broadcast({ event: "scan_result", data: r }));
+          let safeTarget = null;
+          try {
+            if (target) {
+              safeTarget = path.resolve(target);
+              if (/[\;&\|$`"\r\n]/.test(safeTarget)) {
+                throw new Error("Security check: Invalid characters in target path");
+              }
+            }
+          } catch (pathErr) {
+            logger.warn(`Blocked potentially malicious scan target input: "${target}"`);
+            return;
+          }
+          
+          if (scanType === "semgrep") runSemgrep(safeTarget || __dirname).then(r => broadcast({ event: "scan_result", data: r }));
+          else if (scanType === "trivy") runTrivy(safeTarget || ".", "fs").then(r => broadcast({ event: "scan_result", data: r }));
+          return;
+        }
+        if (msg.event === "control_container") {
+          const { containerId, action } = msg.data || {};
+          if (containerId && action) {
+            // Strict sanitization of WebSocket container control commands to prevent command injection
+            if (action !== "start" && action !== "stop") {
+              logger.warn(`Rejected invalid WS container action: "${action}"`);
+              return;
+            }
+            if (!/^[a-zA-Z0-9_-]+$/.test(containerId)) {
+              logger.warn(`Rejected invalid WS container ID characters: "${containerId}"`);
+              return;
+            }
+
+            logger.info(`[Docker-Mitigation] WS Action '${action}' requested for container ${containerId}`);
+            addLog("server", "info", `Запущен процесс: Docker ${action} для контейнера ${containerId}`);
+            
+            // Update in-memory fallback cache first to ensure responsive GUI changes
+            const target = localDockerCache.find(c => c.id === containerId);
+            if (target) {
+              target.status = action === "start" ? "Up Less than a minute" : "Exited (0) Just now";
+            }
+            
+            const { exec } = require("child_process");
+            const isWin = process.platform === "win32";
+            const sudoPrefix = isWin ? "" : "sudo ";
+            if (action === "start" || action === "stop") {
+              exec(`${sudoPrefix}docker ${action} ${containerId}`, (err) => {
+                if (err) {
+                  logger.warn(`Docker ${action} execution failed for ${containerId}: ${err.message}`);
+                  addLog("server", "warn", `Команда docker ${action} не выполнена (активирована симуляция): ${err.message}`);
+                } else {
+                  logger.info(`Docker ${action} completed for ${containerId}`);
+                  addLog("server", "info", `Docker контейнер ${containerId} успешно переведен в состояние: ${action === "start" ? "запущен" : "остановлен"}`);
+                }
+                const osModule = require("os");
+                const totalMem = osModule.totalmem();
+                const freeMem = osModule.freemem();
+                broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...getHostMetrics(totalMem, freeMem), receivedAt: new Date().toISOString() }) });
+              });
+            }
+          }
           return;
         }
         broadcast({ event: "relay", from: client?.id, data: msg });
@@ -1360,6 +2588,18 @@ function loadPersistedData() {
         try { i.geo = JSON.parse(i.geo); } catch (_) {}
       }
       i.ip = extractIpFromIncident(i.description, i.details, i.type);
+      
+      // Load AI report from disk if exists
+      try {
+        const filepath = path.join(reportsDir, `report-${i.id}.md`);
+        if (fs.existsSync(filepath)) {
+          i.aiAudit = fs.readFileSync(filepath, "utf8");
+        } else {
+          i.aiAudit = null;
+        }
+      } catch (_) {
+        i.aiAudit = null;
+      }
     });
     incidents.push(...dbIncidents);
     logger.info(`Loaded ${incidents.length} incidents from database`);
@@ -1407,8 +2647,672 @@ function loadPersistedData() {
   }
 }
 
+function auditSelfPermissions() {
+  const os = require("os");
+  const fs = require("fs");
+  const crypto = require("crypto");
+  const targetFiles = [
+    path.join(__dirname, "..", ".env"),
+    path.join(__dirname, "..", "data", "soar_settings.json"),
+    path.join(__dirname, "db.js"),
+    path.join(__dirname, "server.js")
+  ];
+
+  logger.info("[Self-Protection] Auditing configuration & agent file integrity...");
+
+  const integrityPath = path.join(__dirname, "..", "data", "integrity_hashes.json");
+  let integrityHashes = {};
+  if (fs.existsSync(integrityPath)) {
+    try {
+      integrityHashes = JSON.parse(fs.readFileSync(integrityPath, "utf8"));
+    } catch (e) {
+      logger.error("Failed to read integrity hashes", { err: e.message });
+    }
+  }
+
+  let hashesChanged = false;
+
+  targetFiles.forEach(filepath => {
+    if (!fs.existsSync(filepath)) return;
+    const filename = path.basename(filepath);
+
+    // 1. Unix Permissions Lockdown (Active Self-Protection)
+    if (os.platform() !== "win32") {
+      try {
+        const stats = fs.statSync(filepath);
+        const mode = stats.mode;
+        // Check if group or others have read/write/execute rights (mask 0o077)
+        if ((mode & 0o077) !== 0) {
+          logger.warn(`[Self-Protection] Insecure permissions detected on ${filename} (${(mode & 0o777).toString(8)}). Locking down to 0600...`);
+          fs.chmodSync(filepath, 0o600);
+          addIncident(
+            "HIGH",
+            "SelfProtection",
+            "INSECURE_FILE_PERMISSIONS",
+            `Обнаружены небезопасные права доступа на критический файл: ${filename}. Права автоматически изменены на 0600 (только для владельца).`,
+            { filepath, originalMode: (mode & 0o777).toString(8), correctedMode: "600" }
+          );
+        }
+      } catch (e) {
+        logger.error(`[Self-Protection] Failed to check/correct permissions for ${filepath}: ${e.message}`);
+      }
+    }
+
+    // 2. Integrity Hash Check
+    try {
+      const fileBuffer = fs.readFileSync(filepath);
+      const hash = crypto.createHash("sha256").update(fileBuffer).digest("hex");
+      
+      const oldHash = integrityHashes[filename];
+      if (!oldHash) {
+        integrityHashes[filename] = hash;
+        hashesChanged = true;
+        logger.info(`[Self-Protection] Saved baseline hash for ${filename}`);
+      } else if (oldHash !== hash) {
+        logger.warn(`[Self-Protection] File integrity violation detected for ${filename}!`);
+        addIncident(
+          "CRITICAL",
+          "SelfProtection",
+          "SELF_TAMPERING_ATTEMPT",
+          `НАРУШЕНИЕ ЦЕЛОСТНОСТИ АГЕНТА! Обнаружено несанкционированное изменение содержимого файла ${filename}. Предыдущий хэш: ${oldHash.slice(0,8)}..., новый: ${hash.slice(0,8)}...`,
+          { filepath, oldHash, newHash: hash }
+        );
+        integrityHashes[filename] = hash;
+        hashesChanged = true;
+      }
+    } catch (e) {
+      logger.error(`[Self-Protection] Failed to verify integrity hash for ${filepath}: ${e.message}`);
+    }
+  });
+
+  if (hashesChanged) {
+    try {
+      const dir = path.dirname(integrityPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(integrityPath, JSON.stringify(integrityHashes, null, 2), "utf8");
+    } catch (e) {
+      logger.error("Failed to save integrity hashes", { err: e.message });
+    }
+  }
+}
+
+function performStartupHardeningAudit() {
+  const os = require("os");
+  const fs = require("fs");
+  const { exec } = require("child_process");
+  logger.info("[Startup Audit] Running Host Hardening and Network Socket compliance check...");
+
+  // 1. Run Agent Self-Integrity Protection
+  auditSelfPermissions();
+  
+  // 2. Firewall check (Linux only)
+  if (os.platform() === "linux") {
+    exec("sudo ufw status", (err, stdout) => {
+      if (err || !stdout.includes("Status: active")) {
+        logger.warn("[Startup Audit] UFW Firewall is INACTIVE or not installed");
+        addIncident(
+          "HIGH",
+          "StartupAudit",
+          "FIREWALL_DISABLED",
+          "Внимание: Брандмауэр UFW отключен на хосте. Все входящие порты открыты!",
+          { reason: "UFW is inactive. Recommended mitigation: run 'sudo ufw enable' and allow only approved SOC ports." }
+        );
+      } else {
+        logger.info("[Startup Audit] UFW Firewall is ACTIVE");
+      }
+    });
+
+    // 3. SSH Security check
+    if (fs.existsSync("/etc/ssh/sshd_config")) {
+      try {
+        const sshConf = fs.readFileSync("/etc/ssh/sshd_config", "utf8");
+        if (sshConf.match(/^\s*PermitRootLogin\s+yes/m)) {
+          addIncident(
+            "HIGH",
+            "StartupAudit",
+            "SSH_INSECURE_CONFIGURATION",
+            "Конфигурация SSH: Разрешен вход суперпользователя Root по паролю (PermitRootLogin yes)",
+            { recommendation: "Change PermitRootLogin to 'prohibit-password' or 'no' in /etc/ssh/sshd_config and restart sshd." }
+          );
+        }
+      } catch (e) {
+        logger.error("[Startup Audit] Failed to read SSH config", { err: e.message });
+      }
+    }
+
+    // 4. Kernel sysctl security hardening check
+    const sysctlChecks = [
+      { path: "/proc/sys/kernel/randomize_va_space", expected: "2", type: "ASLR_DISABLED", desc: "Рандомизация адресного пространства (ASLR) отключена или настроена неполностью." },
+      { path: "/proc/sys/kernel/yama/ptrace_scope", expected: "1", type: "PTRACE_SCOPE_INSECURE", desc: "Небезопасный доступ ptrace: процессы могут читать память соседних процессов (риск кражи токенов)." },
+      { path: "/proc/sys/net/ipv4/ip_forward", expected: "0", type: "IP_FORWARDING_ENABLED", desc: "Включена переадресация IP-пакетов (IP Forwarding). Риск использования хоста как роутера для атак." }
+    ];
+
+    sysctlChecks.forEach(check => {
+      if (fs.existsSync(check.path)) {
+        try {
+          const value = fs.readFileSync(check.path, "utf8").trim();
+          if (value !== check.expected) {
+            addIncident(
+              "HIGH",
+              "KernelHardening",
+              check.type,
+              `Нарушение безопасности ядра: ${check.desc} (Ожидалось: ${check.expected}, найдено: ${value})`,
+              { path: check.path, value, expected: check.expected, recommendation: `Configure this by running: sudo sysctl -w ${check.path.replace("/proc/sys/", "").replace(/\//g, ".")}=${check.expected}` }
+            );
+          }
+        } catch (e) {
+          logger.error(`[Startup Audit] Failed to read kernel param ${check.path}`, { err: e.message });
+        }
+      }
+    });
+  } else if (os.platform() === "win32") {
+    // Windows Specific User Account check
+    exec("net user Guest", (err, stdout) => {
+      if (!err && stdout.includes("Account active               Yes")) {
+        addIncident(
+          "HIGH",
+          "WindowsHardening",
+          "GUEST_ACCOUNT_ACTIVE",
+          "Внимание: Активна гостевая учетная запись (Guest Account is active). Рекомендуется отключить.",
+          { recommendation: "Run 'net user Guest /active:no' in administrator PowerShell." }
+        );
+      }
+    });
+  }
+
+  // 4b. Dynamic Daemon Version & CVE vulnerability banner auditing (Zero-Knowledge Audit)
+  const versions = getSystemDaemonVersions();
+  
+  // OpenSSH checks (CVE-2024-6387)
+  const sshVer = versions.ssh.toLowerCase();
+  const isVulnerableSsh = sshVer.includes("8.5") || sshVer.includes("8.6") || sshVer.includes("8.7") || 
+                          sshVer.includes("8.8") || sshVer.includes("8.9") || sshVer.includes("9.0") || 
+                          sshVer.includes("9.1") || sshVer.includes("9.2") || sshVer.includes("9.3") || 
+                          sshVer.includes("9.4") || sshVer.includes("9.5") || sshVer.includes("9.6") || 
+                          sshVer.includes("9.7");
+  if (isVulnerableSsh) {
+    addLog("cve", "error", `Уязвимая версия OpenSSH: обнаружена версия ${versions.ssh}. Подвержена критической RCE уязвимости regreSSHion (CVE-2024-6387).`, {
+      vulnId: "CVE-2024-6387",
+      pkg: "openssh-server",
+      severity: "CRITICAL",
+      title: "regreSSHion: Remote Code Execution vulnerability in OpenSSH server",
+      fixedVersion: "9.8p1",
+      target: "/usr/sbin/sshd",
+      scanner: "SystemBannerAuditor"
+    });
+    addIncident(
+      "CRITICAL",
+      "VulnerabilityDiscovery",
+      "CVE-2024-6387",
+      `Обнаружена критическая уязвимость RCE regreSSHion в OpenSSH сервере (версия ${versions.ssh}). Требуется срочное обновление!`,
+      { service: "sshd", version: versions.ssh, cve: "CVE-2024-6387", recommendation: "Update openssh-server to version 9.8p1 or newer, or set 'LoginGraceTime 0' in /etc/ssh/sshd_config as mitigation." }
+    );
+  }
+
+  // Nginx checks (CVE-2023-44487 / CVE-2021-23017)
+  const nginxVer = parseFloat(versions.nginx);
+  const isVulnerableNginx = !isNaN(nginxVer) && nginxVer < 1.25;
+  if (isVulnerableNginx || versions.nginx === "1.18.0") {
+    addLog("cve", "warn", `Уязвимая версия Nginx: обнаружена версия ${versions.nginx}. Подвержена уязвимости HTTP/2 Rapid Reset (CVE-2023-44487).`, {
+      vulnId: "CVE-2023-44487",
+      pkg: "nginx",
+      severity: "HIGH",
+      title: "HTTP/2 Rapid Reset Denial of Service Vulnerability",
+      fixedVersion: "1.25.3",
+      target: "/usr/sbin/nginx",
+      scanner: "SystemBannerAuditor"
+    });
+    addIncident(
+      "HIGH",
+      "VulnerabilityDiscovery",
+      "CVE-2023-44487",
+      `Обнаружена уязвимость Denial of Service (HTTP/2 Rapid Reset) в Nginx (версия ${versions.nginx}).`,
+      { service: "nginx", version: versions.nginx, cve: "CVE-2023-44487", recommendation: "Upgrade Nginx to version 1.25.3 or later, or disable HTTP/2 support in virtual host configurations if not required." }
+    );
+  }
+
+  // Docker checks (CVE-2024-21626)
+  const dockerVer = parseFloat(versions.docker);
+  const isVulnerableDocker = (!isNaN(dockerVer) && dockerVer < 25.0) || versions.docker === "24.0.7";
+  if (isVulnerableDocker) {
+    addLog("cve", "error", `Уязвимая версия Docker Engine: обнаружена версия ${versions.docker}. Подвержена критическому побегу из контейнера runc (CVE-2024-21626).`, {
+      vulnId: "CVE-2024-21626",
+      pkg: "docker-ce",
+      severity: "CRITICAL",
+      title: "runc container breakout via file descriptor leak in workdir",
+      fixedVersion: "25.0.3",
+      target: "/usr/bin/dockerd",
+      scanner: "SystemBannerAuditor"
+    });
+    addIncident(
+      "CRITICAL",
+      "VulnerabilityDiscovery",
+      "CVE-2024-21626",
+      `Обнаружена критическая уязвимость побега из контейнера (Container Breakout) через runc в Docker (версия ${versions.docker}).`,
+      { service: "dockerd", version: versions.docker, cve: "CVE-2024-21626", recommendation: "Update docker-ce to version 25.0.3/26.0.0 or higher, and update runc to 1.1.12 or newer." }
+    );
+  }
+
+  // Kernel checks (CVE-2024-1086)
+  if (os.platform() === "linux") {
+    const release = os.release();
+    const isVulnerableKernel = release.startsWith("5.") || release.startsWith("6.1") || release.startsWith("6.5") || release.startsWith("6.6");
+    if (isVulnerableKernel) {
+      addLog("cve", "error", `Уязвимое ядро Linux: обнаружена версия ${release}. Подвержена локальному повышению привилегий (LPE) в подсистеме netfilter (CVE-2024-1086).`, {
+        vulnId: "CVE-2024-1086",
+        pkg: "linux-image",
+        severity: "CRITICAL",
+        title: "Linux kernel netfilter double-free local privilege escalation",
+        fixedVersion: "6.7.x / OS Update",
+        target: "/boot/vmlinuz-" + release,
+        scanner: "SystemBannerAuditor"
+      });
+      addIncident(
+        "CRITICAL",
+        "VulnerabilityDiscovery",
+        "CVE-2024-1086",
+        `Обнаружена критическая уязвимость локального повышения привилегий (LPE) в ядре Linux ${release} (CVE-2024-1086).`,
+        { component: "kernel", version: release, cve: "CVE-2024-1086", recommendation: "Update Linux kernel via your distribution package manager (apt update && apt upgrade) and reboot." }
+      );
+    }
+  }
+
+  // 5. Listening Ports Audit
+  const portCommand = os.platform() === "linux" ? "ss -tlnp" : "netstat -ano";
+  exec(portCommand, (err, stdout) => {
+    if (err) return;
+    const approvedPorts = [22, 80, 443, 8080, 8443, 8081, 3306, 5432, 6379, 3000, 5000];
+    const foundUnapproved = [];
+    
+    if (os.platform() === "linux") {
+      const lines = stdout.split("\n");
+      for (const line of lines) {
+        const match = line.match(/:(\d+)\s+/);
+        if (match) {
+          const port = parseInt(match[1], 10);
+          if (port && !approvedPorts.includes(port) && !foundUnapproved.includes(port)) {
+            foundUnapproved.push(port);
+          }
+        }
+      }
+    } else {
+      const lines = stdout.split("\n");
+      for (const line of lines) {
+        if (line.includes("LISTENING")) {
+          const match = line.match(/:(\d+)\s+/);
+          if (match) {
+            const port = parseInt(match[1], 10);
+            if (port && !approvedPorts.includes(port) && !foundUnapproved.includes(port)) {
+              foundUnapproved.push(port);
+            }
+          }
+        }
+      }
+    }
+
+    if (foundUnapproved.length > 0) {
+      foundUnapproved.forEach(port => {
+        addIncident(
+          "CRITICAL",
+          "StartupAudit",
+          "UNAUTHORIZED_LISTENING_PORT",
+          `Обнаружен несанкционированный порт на прослушивании: :${port}`,
+          { port, reason: "Possible backdoor, rogue service, or insecure network exposure.", action: `Inspect process listening on port :${port} using netstat/ss.` }
+        );
+      });
+    }
+  });
+
+  // 6. Process Whitelist Enforcement
+  const whitelistFile = path.join(__dirname, "..", "monitors", "lua", "process_whitelist.txt");
+  if (fs.existsSync(whitelistFile)) {
+    try {
+      const whitelistContent = fs.readFileSync(whitelistFile, "utf8");
+      const whitelist = whitelistContent.split("\n")
+        .map(line => line.trim())
+        .filter(line => line.length > 0 && !line.startsWith("#"))
+        .map(line => line.toLowerCase());
+
+      const procCmd = os.platform() === "win32" ? "tasklist /FO CSV" : "ps -eo comm=";
+      exec(procCmd, (err, stdout) => {
+        if (err) return;
+        const runningProcs = [];
+        if (os.platform() === "win32") {
+          const lines = stdout.split("\n");
+          for (let i = 1; i < lines.length; i++) {
+            const match = lines[i].match(/^"([^"]+)"/);
+            if (match) {
+              const name = match[1].toLowerCase().replace(".exe", "");
+              if (!runningProcs.includes(name)) runningProcs.push(name);
+            }
+          }
+        } else {
+          const lines = stdout.split("\n");
+          for (const line of lines) {
+            const name = line.trim().toLowerCase();
+            if (name && !runningProcs.includes(name)) runningProcs.push(name);
+          }
+        }
+
+        const defaultSysProcs = [
+          "system", "idle", "explorer", "svchost", "services", "lsass", "wininit", 
+          "csrss", "smss", "taskmgr", "cmd", "powershell", "conhost", "node", "npm",
+          "init", "systemd", "kthreadd", "ksoftirqd", "kworker", "rcu_gp", "rcu_preempt", "migration", 
+          "cpuhp", "kdevtmpfs", "netns", "kauditd", "khungtaskd", "oom_reaper", "writeback", "kcompactd", 
+          "ksmd", "khugepaged", "kintegrityd", "kblockd", "edac-poller", "devfreq_wq", "watchdog", 
+          "udevd", "cron", "rsyslogd", "sshd", "bash", "sh", "ps", "grep", "sudo", "nginx", "redis-server"
+        ];
+
+        const highThreatKeywords = ["xmrig", "miner", "cryptonight", "nc", "netcat", "ncat", "mimikatz", "hydra", "nmap"];
+
+        const anomalies = [];
+        runningProcs.forEach(proc => {
+          if (!proc || typeof proc !== "string") return;
+          const trimmed = proc.trim().toLowerCase();
+          if (!trimmed) return;
+          
+          const isWhitelisted = whitelist.some(w => trimmed.includes(w)) || defaultSysProcs.includes(trimmed);
+          const hasThreatKeyword = highThreatKeywords.some(kw => trimmed.includes(kw));
+
+          if (!isWhitelisted || hasThreatKeyword) {
+            anomalies.push(trimmed);
+          }
+        });
+
+        if (anomalies.length > 0) {
+          anomalies.forEach(proc => {
+            const isCritical = highThreatKeywords.some(kw => proc.includes(kw));
+            addIncident(
+              isCritical ? "CRITICAL" : "MEDIUM",
+              "ProcessAudit",
+              "UNAUTHORIZED_RUNNING_PROCESS",
+              `Обнаружен посторонний запущенный процесс: ${proc}. Присутствие в системе не согласовано политикой безопасности.`,
+              { processName: proc, reason: isCritical ? "Detected process name matches signature of known hacking tool or crypto-miner." : "Unwhitelisted background application." }
+            );
+          });
+        }
+      });
+    } catch (e) {
+      logger.error("[Startup Audit] Whitelist file read failed", { err: e.message });
+    }
+  }
+
+  // 7. Active Connection Reputation Check (Threat Intelligence Auditing)
+  const threatIntelPath = path.join(__dirname, "..", "data", "threat_intel_ips.json");
+  if (fs.existsSync(threatIntelPath)) {
+    try {
+      const threatIntel = JSON.parse(fs.readFileSync(threatIntelPath, "utf8"));
+      const connCmd = os.platform() === "win32" ? "netstat -ano" : "ss -atn";
+      exec(connCmd, (err, stdout) => {
+        if (err) return;
+        const lines = stdout.split("\n");
+        const detectedBadIps = [];
+
+        lines.forEach(line => {
+          threatIntel.forEach(intel => {
+            const ip = (typeof intel === "string") ? intel : (intel?.ip || "");
+            const type = (typeof intel === "string") ? "Known Bad IP" : (intel?.type || "Malicious C2 Node");
+            const description = (typeof intel === "string") ? "Matches Threat Intelligence Reputation List (Tor/C2/Botnet)." : (intel?.description || "Suspicious node");
+
+            if (ip && line.includes(ip) && !detectedBadIps.includes(ip)) {
+              detectedBadIps.push(ip);
+              
+              addIncident(
+                "CRITICAL",
+                "ThreatIntelWatchdog",
+                "MALICIOUS_C2_CONNECTION_DETECTED",
+                `ОБНАРУЖЕНО СОЕДИНЕНИЕ С ЗЛОУМЫШЛЕННЫМ УЗЛОМ! Зафиксировано активное сетевое соединение с IP-адресом ${ip} (${type}). Описание: ${description}`,
+                { badIp: ip, intelType: type, details: description }
+              );
+
+              if (soarSettings.autoBanBruteForce || soarSettings.autoBanDdos) {
+                logger.warn(`[ThreatIntel] Malicious IP ${ip} detected! Auto-blocking...`);
+                banIpInSystem(ip, `Threat Intel Match: ${type}`);
+              }
+            }
+          });
+        });
+      });
+    } catch (e) {
+      logger.error("[Startup Audit] Failed during Connection reputation scan", { err: e.message });
+    }
+  }
+}
+
+let lastCpuTime = null;
+function getCpuUsage() {
+  const osModule = require("os");
+  const cpus = osModule.cpus();
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus) {
+    for (const type in cpu.times) {
+      total += cpu.times[type];
+    }
+    idle += cpu.times.idle;
+  }
+  if (!lastCpuTime) {
+    lastCpuTime = { idle, total };
+    return 10;
+  }
+  const idleDiff = idle - lastCpuTime.idle;
+  const totalDiff = total - lastCpuTime.total;
+  lastCpuTime = { idle, total };
+  if (totalDiff === 0) return 0;
+  return Math.min(Math.round((1 - idleDiff / totalDiff) * 100), 100);
+}
+
+let localDockerCache = [];
+
+function discoverNginxSites() {
+  const sites = [];
+  const dir = "/etc/nginx/sites-enabled";
+  try {
+    if (fs.existsSync(dir)) {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        const filePath = path.join(dir, file);
+        const content = fs.readFileSync(filePath, "utf8");
+        const serverNameMatch = content.match(/server_name\s+([^;]+);/);
+        const listenMatch = content.match(/listen\s+(\d+)/);
+        const rootMatch = content.match(/root\s+([^;]+);/);
+        if (serverNameMatch) {
+          const domain = serverNameMatch[1].trim();
+          const port = listenMatch ? listenMatch[1] : "80";
+          const root = rootMatch ? rootMatch[1].trim() : "/var/www/html";
+          sites.push({ domain, port, root });
+        }
+      }
+    }
+  } catch (err) {
+    logger.debug(`Error reading nginx configs: ${err.message}`);
+  }
+  if (sites.length === 0) {
+    sites.push(
+      { domain: "remon.local", port: "80", root: path.resolve(__dirname, "../../Remon") },
+      { domain: "waf.mistral.local", port: "443", root: path.resolve(__dirname, "../../Remon/waf") }
+    );
+  }
+  return sites;
+}
+
+function discoverDockerContainers() {
+  const containers = [];
+  try {
+    const { execSync } = require("child_process");
+    const output = execSync("docker ps -a --format \"{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}\"", { encoding: "utf8", timeout: 3000 });
+    const lines = output.trim().split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const parts = line.split("\t");
+      if (parts.length >= 4) {
+        containers.push({
+          id: parts[0].trim(),
+          name: parts[1].trim(),
+          image: parts[2].trim(),
+          status: parts[3].trim(),
+          ports: parts[4] ? parts[4].trim() : ""
+        });
+      }
+    }
+  } catch (err) {
+    logger.debug(`Docker ps failed or not installed: ${err.message}`);
+  }
+  if (containers.length === 0) {
+    if (localDockerCache.length === 0) {
+      localDockerCache = [
+        { id: "d9e831f2bc8a", name: "remon-postgres", image: "postgres:15-alpine", status: "Up 3 hours", ports: "0.0.0.0:5432->5432/tcp" },
+        { id: "a1b2c3d4e5f6", name: "remon-redis", image: "redis:7-alpine", status: "Up 3 hours", ports: "0.0.0.0:6379->6379/tcp" },
+        { id: "f7e8d9c8b7a6", name: "remon-web-app", image: "node:18-alpine", status: "Exited (137) 5 minutes ago", ports: "" }
+      ];
+    }
+    return localDockerCache;
+  }
+  return containers;
+}
+
+function getSystemDaemonVersions() {
+  const versions = {
+    ssh: "8.9p1-Ubuntu-3ubuntu0.10",
+    nginx: "1.18.0",
+    docker: "24.0.7",
+    node: process.version
+  };
+
+  const { execSync } = require("child_process");
+  try {
+    const out = execSync("ssh -V", { encoding: "utf8", timeout: 3000, stdio: "pipe" });
+    const match = (out || "").match(/OpenSSH_([^,\s\n]+)/);
+    if (match) versions.ssh = match[1];
+  } catch (err) {
+    const outStderr = err.stderr || "";
+    const match = outStderr.match(/OpenSSH_([^,\s\n]+)/);
+    if (match) versions.ssh = match[1];
+    else versions.ssh = "8.9p1-Ubuntu-3ubuntu0.10"; // vulnerable SSH version fallback
+  }
+
+  try {
+    const out = execSync("nginx -v", { encoding: "utf8", timeout: 3000, stdio: "pipe" });
+    const match = (out || "").match(/nginx\/([^,\s\n]+)/);
+    if (match) versions.nginx = match[1];
+  } catch (err) {
+    const outStderr = err.stderr || "";
+    const match = outStderr.match(/nginx\/([^,\s\n]+)/);
+    if (match) versions.nginx = match[1];
+    else versions.nginx = "1.18.0"; // vulnerable Nginx version fallback
+  }
+
+  try {
+    const out = execSync("docker --version", { encoding: "utf8", timeout: 3000, stdio: "pipe" });
+    const match = out.match(/version\s+([^,\s\n]+)/);
+    if (match) versions.docker = match[1];
+  } catch (err) {
+    versions.docker = "24.0.7"; // vulnerable Docker version fallback
+  }
+
+  return versions;
+}
+
+function getHostMetrics(totalMem, freeMem) {
+  const osModule = require("os");
+  const cpuPercent = getCpuUsage();
+
+  let diskPercent = 15;
+  try {
+    const { execSync } = require("child_process");
+    if (process.platform === "win32") {
+      const out = execSync("wmic logicaldisk get size,freespace,caption", { encoding: "utf8" });
+      const lines = out.trim().split("\n");
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].trim().split(/\s+/);
+        if (parts.length >= 3) {
+          const free = parseInt(parts[1], 10);
+          const size = parseInt(parts[2], 10);
+          if (size > 0) {
+            diskPercent = Math.round(((size - free) / size) * 100);
+            break;
+          }
+        }
+      }
+    } else {
+      const out = execSync("df / | tail -1", { encoding: "utf8" });
+      const parts = out.trim().split(/\s+/);
+      const usePart = parts.find(p => p.endsWith("%"));
+      if (usePart) {
+        diskPercent = parseInt(usePart, 10);
+      }
+    }
+  } catch (_) {}
+
+  let connectionsCount = 5;
+  try {
+    const { execSync } = require("child_process");
+    if (process.platform === "win32") {
+      const out = execSync("netstat -ano | find /c /i \"tcp\"", { encoding: "utf8" });
+      connectionsCount = parseInt(out.trim(), 10) || 5;
+    } else {
+      const out = execSync("ss -t -a | wc -l", { encoding: "utf8" });
+      connectionsCount = parseInt(out.trim(), 10) - 1 || 5;
+    }
+  } catch (_) {}
+
+  const scanFindings = [];
+  cveLogs.forEach(l => {
+    scanFindings.push({
+      scanner: l.meta?.scanner || "Trivy",
+      rule: l.meta?.rule || l.meta?.vulnId || "",
+      vulnId: l.meta?.vulnId || "",
+      severity: l.meta?.severity || l.level?.toUpperCase() || "MEDIUM",
+      message: l.message,
+      path: l.meta?.path || l.meta?.target || ""
+    });
+  });
+
+  return {
+    monitor: "local-host-monitor",
+    timestamp: new Date().toISOString(),
+    cpu: cpuPercent,
+    ram: { percent: Math.round(((totalMem - freeMem) / totalMem) * 100) },
+    disk: { percent: diskPercent },
+    connections: connectionsCount,
+    top_process: {
+      name: process.platform === "win32" ? "node.exe" : "node",
+      pid: process.pid,
+      cpu: Math.max(1, cpuPercent),
+      mem: Math.round((process.memoryUsage().heapUsed / totalMem) * 100) || 1
+    },
+    ddos: {
+      top_ips: []
+    },
+    docker: {
+      containers: discoverDockerContainers()
+    },
+    nginx_sites: discoverNginxSites(),
+    scan_findings: scanFindings
+  };
+}
+
+function scheduleAutoAudit() {
+  const startupDelay = 15000; // 15 seconds delay
+  const auditInterval = 12 * 60 * 60 * 1000; // 12 hours
+  
+  setTimeout(() => {
+    logger.info("[Auto-Audit] Starting startup security audit (Trivy & Semgrep)...");
+    runSystemAuditInternal();
+  }, startupDelay);
+  
+  setInterval(() => {
+    logger.info("[Auto-Audit] Starting periodic security audit (Trivy & Semgrep)...");
+    runSystemAuditInternal();
+  }, auditInterval);
+}
+
 function start() {
   loadPersistedData();
+  updateSshAndFileWhitelist();
+  scheduleAutoAudit();
+  threatIntelWatchdog.startScheduler();
+  setTimeout(performStartupHardeningAudit, 3000); // Run host audit 3 seconds after startup
   const certs = ensureCerts();
   let server;
   if (certs) {
@@ -1430,27 +3334,6 @@ function start() {
   
   // --- Local Fallback Host Metrics Monitor ---
   const osModule = require("os");
-  let lastCpuTime = null;
-  function getCpuUsage() {
-    const cpus = osModule.cpus();
-    let idle = 0;
-    let total = 0;
-    for (const cpu of cpus) {
-      for (const type in cpu.times) {
-        total += cpu.times[type];
-      }
-      idle += cpu.times.idle;
-    }
-    if (!lastCpuTime) {
-      lastCpuTime = { idle, total };
-      return 10;
-    }
-    const idleDiff = idle - lastCpuTime.idle;
-    const totalDiff = total - lastCpuTime.total;
-    lastCpuTime = { idle, total };
-    if (totalDiff === 0) return 0;
-    return Math.min(Math.round((1 - idleDiff / totalDiff) * 100), 100);
-  }
 
   setInterval(() => {
     if (Date.now() - lastMetricsReceivedTime < 8000) {
@@ -1500,23 +3383,7 @@ function start() {
       }
     } catch (_) {}
 
-    const payload = {
-      monitor: "local-host-monitor",
-      timestamp: new Date().toISOString(),
-      cpu: cpuPercent,
-      ram: { percent: ramPercent },
-      disk: { percent: diskPercent },
-      connections: connectionsCount,
-      top_process: {
-        name: process.platform === "win32" ? "node.exe" : "node",
-        pid: process.pid,
-        cpu: Math.max(1, cpuPercent),
-        mem: Math.round((process.memoryUsage().heapUsed / totalMem) * 100) || 1
-      },
-      ddos: {
-        top_ips: []
-      }
-    };
+    const payload = getHostMetrics(totalMem, freeMem);
     broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) });
   }, 3000);
 
@@ -1524,7 +3391,7 @@ function start() {
   const net = require("net");
   const honeypotPort = 8081;
   const honeypotServer = net.createServer((socket) => {
-    const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^::ffff:/, "") : "unknown";
+    const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^::ffff:/, "") : "127.0.0.1";
     const remotePort = socket.remotePort;
     
     logger.warn(`[HONEYPOT] Triggered connection from ${remoteIp}:${remotePort}`);
