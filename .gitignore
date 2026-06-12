@@ -3,3 +3,7 @@ logs/
 .pids/
 .env
 *.log
+data/
+*.db
+*.db-shm
+*.db-wal

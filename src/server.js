@@ -197,6 +197,9 @@ function saveSoarSettings() {
     logger.error("Failed to save SOAR settings", { err: e.message });
   }
 }
+// Force honeypot to be disabled at startup as requested by the user
+soarSettings.honeypotEnabled = false;
+saveSoarSettings();
 
 const vulnerabilitiesDir = path.join(__dirname, "../data/vulnerabilities");
 if (!fs.existsSync(vulnerabilitiesDir)) fs.mkdirSync(vulnerabilitiesDir, { recursive: true });
@@ -784,7 +787,12 @@ class LogManager {
     }
     
     // 3. Honeypot Trigger
-    if (msgLower.includes("remon_payment_gateway") || msgLower.includes("port 8081")) {
+    if (soarSettings.honeypotEnabled && 
+        (msgLower.includes("remon_payment_gateway") || msgLower.includes("port 8081")) &&
+        !msgLower.includes("active on port") &&
+        !msgLower.includes("listening on port") &&
+        !msgLower.includes("deactivated") &&
+        !msgLower.includes("stopped listening")) {
       const ipMatch = message.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
       const ip = ipMatch ? ipMatch[0] : (meta.ip || meta.sourceIp || null);
       incidentManager.addIncident(
