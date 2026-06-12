@@ -170,7 +170,7 @@ function get_ddos_indicators(conns)
         if ip then ip = ip:gsub("^::ffff:", "") end
         
         -- Ignore wildcards, loops, and invalid bracket remnants
-        if ip and ip ~= "0.0.0.0" and ip ~= "::" and ip ~= "*" and not ip:find("%[") then
+        if ip and ip ~= "0.0.0.0" and ip ~= "::" and ip ~= "127.0.0.1" and ip ~= "::1" and ip ~= "localhost" and ip ~= "::ffff:127.0.0.1" and ip ~= "*" and not ip:find("%[") then
             local info = ip_counts[ip]
             if not info then
                 info = { count = 0, syn_recv = 0, estab = 0, ports = {} }

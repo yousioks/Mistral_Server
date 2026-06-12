@@ -74,6 +74,9 @@ const cveLogs = [];
 const clients = new Map();
 const usedNonces = new Set();
 let lastMetricsReceivedTime = 0;
+const pendingMonitorCommands = [];
+const monitorCommandResults = new Map();
+const activeScanRequests = new Map();
 let lastWafPingTime = 0;
 let lastWafHost = "";
 let lastActivityLogTime = Date.now();
@@ -2049,6 +2052,84 @@ app.post("/api/scan/trivy", async (req, res) => {
   res.json(result);
 });
 
+// ── Lua Monitor Command Endpoints ───────────────────────────────────────────
+app.get("/api/monitors/commands", (req, res) => {
+  if (pendingMonitorCommands.length > 0) {
+    const cmd = pendingMonitorCommands.shift();
+    res.json(cmd);
+  } else {
+    res.json(null);
+  }
+});
+
+app.post("/api/monitors/command-results", (req, res) => {
+  const { commandId, success, results, error } = req.body || {};
+  logger.info(`Received monitor command results for ${commandId}: success=${success}`);
+
+  const cmdDetails = monitorCommandResults.get(commandId) || {};
+  const target = cmdDetails.target || ".";
+  const type = cmdDetails.type || "unknown_scan";
+
+  const findingsCount = (results && results.findings) ? results.findings.length : 0;
+  
+  if (success && results && results.findings) {
+    results.findings.forEach(f => {
+      const isTrivy = type.includes("trivy");
+      let logSeverity = "info";
+      const severity = f.severity || "MEDIUM";
+      if (severity === "CRITICAL" || severity === "HIGH" || severity === "ERROR") logSeverity = "error";
+      else if (severity === "MEDIUM" || severity === "WARNING") logSeverity = "warn";
+
+      const message = isTrivy 
+        ? `[Trivy (Monitor)] Обнаружена уязвимость ${f.vulnId} в пакете ${f.pkg} (${severity}). Цель: ${f.target || target}. Заголовок: ${f.title || 'N/A'}. Решение: обновить до версии ${f.fixedVersion || 'N/A'}.`
+        : `[Semgrep (Monitor)] Нарушение правила безопасности ${f.rule} в файле ${f.path}:${f.line} (${severity}). Описание: ${f.message}`;
+      
+      addLog("cve", logSeverity, message, {
+        scanner: isTrivy ? "trivy" : "semgrep",
+        vulnId: f.vulnId || "",
+        pkg: f.pkg || "",
+        severity,
+        title: f.title || "",
+        fixedVersion: f.fixedVersion || "",
+        target: f.target || f.path || target,
+        rule: f.rule || ""
+      });
+    });
+
+    addIncident("HIGH", "SecurityScanner", "VULNERABILITY_DISCOVERY", `Сканирование уязвимостей через Lua-агент завершено (${type} на ${target}). Обнаружено замечаний: ${findingsCount}`);
+  } else if (error) {
+    addLog("server", "error", `Фоновое сканирование через Lua-агент завершилось с ошибкой: ${error}`);
+  }
+
+  // Find WebSocket client and return results
+  const clientWs = activeScanRequests.get(commandId);
+  const broadcastPayload = {
+    event: "scan_result",
+    data: {
+      scanner: type === "semgrep_scan" ? "semgrep" : "trivy",
+      target: target,
+      timestamp: new Date().toISOString(),
+      findings: (results && results.findings) ? results.findings : [],
+      error: error || null
+    }
+  };
+
+  if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+    try {
+      clientWs.send(JSON.stringify(broadcastPayload));
+    } catch (_) {
+      broadcast(broadcastPayload);
+    }
+  } else {
+    broadcast(broadcastPayload);
+  }
+
+  activeScanRequests.delete(commandId);
+  monitorCommandResults.delete(commandId);
+
+  res.json({ success: true });
+});
+
 // ── Scanner installation trigger ─────────────────────────────────────────────
 app.post("/api/install-scanners", (req, res) => {
   const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
@@ -2584,8 +2665,16 @@ function startWSS(server) {
             return;
           }
           
-          if (scanType === "semgrep") runSemgrep(safeTarget || __dirname).then(r => broadcast({ event: "scan_result", data: r }));
-          else if (scanType === "trivy") runTrivy(safeTarget || ".", "fs").then(r => broadcast({ event: "scan_result", data: r }));
+          const cmdId = uuidv4();
+          const targetPath = safeTarget || ".";
+          const type = scanType === "semgrep" ? "semgrep_scan" : "trivy_scan";
+
+          logger.info(`Queueing remote monitor scan command ${cmdId} (${type}) for target: ${targetPath}`);
+          addLog("server", "info", `Отправлена команда сканирования ${scanType} на агент (цель: ${targetPath})`);
+
+          monitorCommandResults.set(cmdId, { type, target: targetPath });
+          pendingMonitorCommands.push({ id: cmdId, type, target: targetPath });
+          activeScanRequests.set(cmdId, ws);
           return;
         }
         if (msg.event === "control_container") {

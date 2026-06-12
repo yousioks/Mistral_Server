@@ -16,6 +16,7 @@ MONITORS=(
     "monitor_auth.lua"
     "monitor_network.lua"
     "monitor_integrity.lua"
+    "monitor_sec_tools.lua"
 )
 
 start_all() {
