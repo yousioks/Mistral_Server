@@ -26,3 +26,9 @@ Xorg
 gnome-shell
 pulseaudio
 pipewire
+
+# Database and docker healthchecks
+pg_isready
+psql
+remon_user
+remon_use
