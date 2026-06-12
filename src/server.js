@@ -119,8 +119,67 @@ let soarSettings = {
   aiModel: "deepseek-v4-pro",
   aiThreatThreshold: 3,
   aiTriggerOnLeaks: true,
-  aiTriggerOnCritical: true
+  aiTriggerOnCritical: true,
+  honeypotEnabled: false // default disabled
 };
+
+// Honeypot global state and control helpers
+let honeypotServer = null;
+let isHoneypotRunning = false;
+
+function startHoneypot() {
+  if (isHoneypotRunning) return;
+  const net = require("net");
+  const honeypotPort = 8081;
+  honeypotServer = net.createServer((socket) => {
+    const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^::ffff:/, "") : "127.0.0.1";
+    const remotePort = socket.remotePort;
+    
+    logger.warn(`[HONEYPOT] Triggered connection from ${remoteIp}:${remotePort}`);
+    
+    socket.write("HTTP/1.1 200 OK\r\n");
+    socket.write("Content-Type: application/json\r\n");
+    socket.write("Server: remon_payment_gateway/1.0.0\r\n\r\n");
+    socket.write(JSON.stringify({
+      status: "active",
+      service: "remon_payment_gateway",
+      error: "Unauthorized access detected"
+    }) + "\n");
+    socket.end();
+
+    addIncident(
+      "CRITICAL",
+      "Honeypot-Decoy",
+      "HONEYPOT_TRIGGERED",
+      `СРАБАТЫВАНИЕ ХАНИПОТА! Обнаружена несанкционированная попытка доступа к фейковому платежному шлюзу remon_payment_gateway на порту ${honeypotPort}. Источник IP: ${remoteIp}`,
+      { sourceIp: remoteIp, port: remotePort, service: "remon_payment_gateway" }
+    );
+  });
+  honeypotServer.on("error", (err) => {
+    logger.error("Honeypot Decoy error: " + err.message);
+  });
+  honeypotServer.listen(honeypotPort, () => {
+    isHoneypotRunning = true;
+    logger.info(`Honeypot Decoy (remon_payment_gateway) listening on port ${honeypotPort}`);
+    addLog("server", "info", `Honeypot Decoy active on port ${honeypotPort}`);
+  });
+}
+
+function stopHoneypot() {
+  if (!isHoneypotRunning || !honeypotServer) return;
+  try {
+    const currentServer = honeypotServer;
+    honeypotServer = null;
+    isHoneypotRunning = false;
+    currentServer.close(() => {
+      logger.info("Honeypot Decoy stopped listening on port 8081");
+      addLog("server", "info", "Honeypot Decoy deactivated (stopped listening on port 8081)");
+    });
+  } catch (e) {
+    logger.error("Failed to stop Honeypot: " + e.message);
+  }
+}
+
 if (fs.existsSync(soarSettingsPath)) {
   try {
     const saved = JSON.parse(fs.readFileSync(soarSettingsPath, "utf8"));
@@ -1276,7 +1335,7 @@ app.post("/api/soar-settings", (req, res) => {
   const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
   if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
 
-  const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical } = req.body || {};
+  const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical, honeypotEnabled } = req.body || {};
   if (autoBanDdos !== undefined) soarSettings.autoBanDdos = !!autoBanDdos;
   if (autoBanBruteForce !== undefined) soarSettings.autoBanBruteForce = !!autoBanBruteForce;
   if (aiDefenseEnabled !== undefined) soarSettings.aiDefenseEnabled = !!aiDefenseEnabled;
@@ -1285,6 +1344,18 @@ app.post("/api/soar-settings", (req, res) => {
   if (aiThreatThreshold !== undefined) soarSettings.aiThreatThreshold = Number(aiThreatThreshold);
   if (aiTriggerOnLeaks !== undefined) soarSettings.aiTriggerOnLeaks = !!aiTriggerOnLeaks;
   if (aiTriggerOnCritical !== undefined) soarSettings.aiTriggerOnCritical = !!aiTriggerOnCritical;
+  
+  if (honeypotEnabled !== undefined) {
+    const nextHoneypot = !!honeypotEnabled;
+    if (nextHoneypot !== soarSettings.honeypotEnabled) {
+      soarSettings.honeypotEnabled = nextHoneypot;
+      if (nextHoneypot) {
+        startHoneypot();
+      } else {
+        stopHoneypot();
+      }
+    }
+  }
   
   saveSoarSettings();
   
@@ -3388,39 +3459,9 @@ function start() {
   }, 3000);
 
   // --- Honeypot TCP Listener ---
-  const net = require("net");
-  const honeypotPort = 8081;
-  const honeypotServer = net.createServer((socket) => {
-    const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^::ffff:/, "") : "127.0.0.1";
-    const remotePort = socket.remotePort;
-    
-    logger.warn(`[HONEYPOT] Triggered connection from ${remoteIp}:${remotePort}`);
-    
-    socket.write("HTTP/1.1 200 OK\r\n");
-    socket.write("Content-Type: application/json\r\n");
-    socket.write("Server: remon_payment_gateway/1.0.0\r\n\r\n");
-    socket.write(JSON.stringify({
-      status: "active",
-      service: "remon_payment_gateway",
-      error: "Unauthorized access detected"
-    }) + "\n");
-    socket.end();
-
-    addIncident(
-      "CRITICAL",
-      "Honeypot-Decoy",
-      "HONEYPOT_TRIGGERED",
-      `СРАБАТЫВАНИЕ ХАНИПОТА! Обнаружена несанкционированная попытка доступа к фейковому платежному шлюзу remon_payment_gateway на порту ${honeypotPort}. Источник IP: ${remoteIp}`,
-      { sourceIp: remoteIp, port: remotePort, service: "remon_payment_gateway" }
-    );
-  });
-  honeypotServer.on("error", (err) => {
-    logger.error("Honeypot Decoy error: " + err.message);
-  });
-  honeypotServer.listen(honeypotPort, () => {
-    logger.info(`Honeypot Decoy (remon_payment_gateway) listening on port ${honeypotPort}`);
-    addLog("server", "info", `Honeypot Decoy active on port ${honeypotPort}`);
-  });
+  if (soarSettings.honeypotEnabled) {
+    startHoneypot();
+  }
 
   // --- Background Demo Activity Generator ---
   const demoLogs = [
@@ -3463,7 +3504,7 @@ function start() {
   startDemoActivityGenerator();
 
   process.on("SIGINT", () => {
-    try { honeypotServer.close(); } catch(_) {}
+    try { stopHoneypot(); } catch(_) {}
     server.close(() => process.exit(0));
   });
 }
