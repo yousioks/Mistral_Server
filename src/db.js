@@ -117,6 +117,15 @@ function initSchema() {
       timestamp TEXT NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS custom_models (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      model_name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      api_key TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 }
 
@@ -426,6 +435,34 @@ function deleteLog(id) {
   db.prepare('DELETE FROM logs WHERE id = ?').run(id);
 }
 
+// --- Custom Models ---
+function getCustomModels() {
+  try {
+    const rows = db.prepare('SELECT * FROM custom_models ORDER BY created_at DESC').all();
+    return rows.map(r => {
+      if (r.api_key) {
+        r.api_key = decrypt(r.api_key);
+      }
+      return r;
+    });
+  } catch (e) {
+    console.error('[DB] Failed to get custom models:', e);
+    return [];
+  }
+}
+
+function addCustomModel(model) {
+  const encKey = model.api_key ? encrypt(model.api_key) : null;
+  db.prepare(`
+    INSERT OR REPLACE INTO custom_models (id, name, model_name, base_url, api_key)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(model.id, model.name, model.model_name, model.base_url, encKey);
+}
+
+function deleteCustomModel(id) {
+  db.prepare('DELETE FROM custom_models WHERE id = ?').run(id);
+}
+
 module.exports = {
   addIncident, getIncidents, updateIncident, deleteIncident,
   addLog, getLogs, countLogs, deleteLog,
@@ -436,6 +473,7 @@ module.exports = {
   getUserByChatId, updateUserChatId, getAllChatIds,
   addQuarantine, removeQuarantine, getQuarantinedIps,
   resetDemoData,
-  clearIncidents
+  clearIncidents,
+  getCustomModels, addCustomModel, deleteCustomModel
 };
 

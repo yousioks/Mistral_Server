@@ -1317,8 +1317,25 @@ function addIncident(severity, monitor, type, description, details) {
 const aiClient = AITUNNEL_API_KEY ? new OpenAI({ apiKey: AITUNNEL_API_KEY, baseURL: AITUNNEL_BASE_URL }) : null;
 
 async function askAI(model, messages, temperature = 0.3) {
-  if (!aiClient) throw new Error("AI not configured — set AITUNNEL_API_KEY in .env");
-  const response = await aiClient.chat.completions.create({ model, messages, temperature });
+  let targetClient = aiClient;
+  let targetModel = model;
+
+  const customModels = db.getCustomModels();
+  const customModel = customModels.find(m => m.id === model || m.name === model || m.model_name === model);
+  
+  if (customModel) {
+    targetClient = new OpenAI({
+      apiKey: customModel.api_key || "dummy",
+      baseURL: customModel.base_url || undefined
+    });
+    targetModel = customModel.model_name;
+  }
+
+  if (!targetClient) {
+    throw new Error(`AI model "${model}" is not configured. Please check your settings.`);
+  }
+
+  const response = await targetClient.chat.completions.create({ model: targetModel, messages, temperature });
   return response.choices[0].message.content;
 }
 
@@ -1330,6 +1347,73 @@ app.use(express.json({ limit: "10mb" }));
 // ── Health ──────────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime(), model: activeModel, timestamp: new Date().toISOString() });
+});
+
+// ── Custom Models ───────────────────────────────────────────────────────────
+app.get("/api/custom-models", (_req, res) => {
+  try {
+    const models = db.getCustomModels();
+    const masked = models.map(m => ({
+      ...m,
+      api_key: m.api_key ? "********" : ""
+    }));
+    res.json(masked);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/custom-models", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    const { id, name, model_name, base_url, api_key } = req.body || {};
+    if (!id || !name || !model_name || !base_url) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    
+    let finalApiKey = api_key;
+    if (api_key === "********" || !api_key) {
+      const existing = db.getCustomModels().find(m => m.id === id);
+      if (existing) {
+        finalApiKey = existing.api_key;
+      }
+    }
+    
+    db.addCustomModel({ id, name, model_name, base_url, api_key: finalApiKey });
+    
+    // Broadcast updated models list
+    const updatedModels = db.getCustomModels().map(m => ({
+      ...m,
+      api_key: m.api_key ? "********" : ""
+    }));
+    broadcast({ event: "custom_models_updated", data: updatedModels });
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/custom-models/:id", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
+  try {
+    db.deleteCustomModel(req.params.id);
+    
+    // Broadcast updated models list
+    const updatedModels = db.getCustomModels().map(m => ({
+      ...m,
+      api_key: m.api_key ? "********" : ""
+    }));
+    broadcast({ event: "custom_models_updated", data: updatedModels });
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── SOAR Settings ───────────────────────────────────────────────────────────
@@ -2533,6 +2617,11 @@ function startWSS(server) {
             ws.send(JSON.stringify({ event: "logs_list", data: serverLogs.slice(0, 200) }));
             ws.send(JSON.stringify({ event: "quarantine_updated", data: db.getQuarantinedIps() }));
             ws.send(JSON.stringify({ event: "soar_settings_updated", data: soarSettings }));
+            const customModels = db.getCustomModels().map(m => ({
+              ...m,
+              api_key: m.api_key ? "********" : ""
+            }));
+            ws.send(JSON.stringify({ event: "custom_models_updated", data: customModels }));
           } else {
             addLog("server", "warn", "WS auth failed: bad token", { clientId, ip });
             ws.close(4003, "Invalid token");
@@ -2643,7 +2732,9 @@ function startWSS(server) {
         }
         if (msg.event === "switch_model") {
           const { model } = msg.data || {};
-          if (MODELS[model] || Object.values(MODELS).some(m => m.id === model)) {
+          const isBuiltin = MODELS[model] || Object.values(MODELS).some(m => m.id === model);
+          const isCustom = db.getCustomModels().some(m => m.id === model);
+          if (isBuiltin || isCustom) {
             activeModel = MODELS[model]?.id || model;
             broadcast({ event: "model_changed", data: { model: activeModel } });
             addLog("server", "info", `AI Model switched to: ${activeModel}`);
