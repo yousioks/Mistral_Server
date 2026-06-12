@@ -3644,6 +3644,8 @@ function getHostMetrics(totalMem, freeMem) {
       const out = execSync("ss -t -a | wc -l", { encoding: "utf8" });
       connectionsCount = parseInt(out.trim(), 10) - 1 || 5;
     }
+  } catch (_) {}
+
   let temp = 42;
   try {
     if (process.platform !== "win32") {
