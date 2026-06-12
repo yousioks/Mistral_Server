@@ -80,6 +80,7 @@ const activeScanRequests = new Map();
 let lastWafPingTime = 0;
 let lastWafHost = "";
 let lastActivityLogTime = Date.now();
+let lastKnownUfwStatus = "inactive";
 
 function enrichMetricsWithWaf(payload) {
   const osModule = require("os");
@@ -621,32 +622,35 @@ class ActiveDefenseEngine {
     }
     
     try {
-      const { execSync } = require("child_process");
-      const isWin = process.platform === "win32";
-      const sudoPrefix = isWin ? "" : "sudo ";
-      
-      // Ban in UFW
-      try {
-        execSync(`${sudoPrefix}ufw deny from ${ip} to any`, { stdio: "ignore" });
-        logger.info(`UFW banned IP: ${ip}`);
-      } catch (_) {}
-      
-      // Ban in Fail2ban (if running)
-      try {
-        execSync(`${sudoPrefix}fail2ban-client set sshd banip ${ip}`, { stdio: "ignore" });
-        logger.info(`Fail2ban banned IP in sshd jail: ${ip}`);
-      } catch (f2bErr) {
-        logger.warn(`Fail2ban ban failed (might not be running or installed): ${f2bErr.message}`);
-      }
-      
       db.addQuarantine(ip, reason || "Manual block");
-      logManager.addLog("server", "warn", `IP помещен в карантин (UFW + fail2ban): ${ip}`, { ip, reason });
+      logManager.addLog("server", "warn", `IP помещен в карантин (UFW + fail2ban) [Запуск фоновой блокировки]: ${ip}`, { ip, reason });
       if (typeof broadcast === "function") {
         broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
       }
+
+      // Background OS-level firewall execution
+      const { exec } = require("child_process");
+      const isWin = process.platform === "win32";
+      if (!isWin) {
+        const sudoPrefix = "sudo ";
+        // Ban in UFW asynchronously
+        exec(`${sudoPrefix}ufw deny from ${ip} to any`, (err) => {
+          if (err) logger.warn(`UFW ban failed/ignored for ${ip}: ${err.message}`);
+          else logger.info(`UFW banned IP: ${ip}`);
+        });
+        
+        // Ban in Fail2ban asynchronously
+        exec(`${sudoPrefix}fail2ban-client set sshd banip ${ip}`, (err) => {
+          if (err) logger.warn(`Fail2ban ban failed/ignored for ${ip}: ${err.message}`);
+          else logger.info(`Fail2ban banned IP in sshd jail: ${ip}`);
+        });
+      } else {
+        logger.info(`[ActiveDefense] Windows environment: simulated active ban for ${ip}`);
+      }
+      
       return true;
     } catch (e) {
-      logger.error(`Failed to execute system ban for ${ip}: ${e.message}`);
+      logger.error(`Failed to trigger system ban for ${ip}: ${e.message}`);
       return false;
     }
   }
@@ -657,30 +661,35 @@ class ActiveDefenseEngine {
       return false;
     }
     try {
-      const { execSync } = require("child_process");
-      const isWin = process.platform === "win32";
-      const sudoPrefix = isWin ? "" : "sudo ";
-      
-      // Unban in UFW
-      try {
-        execSync(`${sudoPrefix}ufw delete deny from ${ip} to any`, { stdio: "ignore" });
-        logger.info(`UFW unbanned IP: ${ip}`);
-      } catch (_) {}
-      
-      // Unban in Fail2ban
-      try {
-        execSync(`${sudoPrefix}fail2ban-client set sshd unbanip ${ip}`, { stdio: "ignore" });
-        logger.info(`Fail2ban unbanned IP in sshd jail: ${ip}`);
-      } catch (_) {}
-      
       db.removeQuarantine(ip);
-      logManager.addLog("server", "info", `IP удален из карантина: ${ip}`, { ip });
+      logManager.addLog("server", "info", `IP удален из карантина [Запуск фонового разблокирования]: ${ip}`, { ip });
       if (typeof broadcast === "function") {
         broadcast({ event: "quarantine_updated", data: db.getQuarantinedIps() });
       }
+
+      // Background OS-level firewall execution
+      const { exec } = require("child_process");
+      const isWin = process.platform === "win32";
+      if (!isWin) {
+        const sudoPrefix = "sudo ";
+        // Unban in UFW asynchronously
+        exec(`${sudoPrefix}ufw delete deny from ${ip} to any`, (err) => {
+          if (err) logger.warn(`UFW unban failed/ignored for ${ip}: ${err.message}`);
+          else logger.info(`UFW unbanned IP: ${ip}`);
+        });
+        
+        // Unban in Fail2ban asynchronously
+        exec(`${sudoPrefix}fail2ban-client set sshd unbanip ${ip}`, (err) => {
+          if (err) logger.warn(`Fail2ban unban failed/ignored for ${ip}: ${err.message}`);
+          else logger.info(`Fail2ban unbanned IP in sshd jail: ${ip}`);
+        });
+      } else {
+        logger.info(`[ActiveDefense] Windows environment: simulated active unban for ${ip}`);
+      }
+      
       return true;
     } catch (e) {
-      logger.error(`Failed to execute system unban for ${ip}: ${e.message}`);
+      logger.error(`Failed to trigger system unban for ${ip}: ${e.message}`);
       return false;
     }
   }
@@ -704,6 +713,52 @@ class ActiveDefenseEngine {
         logger.warn(`[Fallback-Defense] Active threat of type [${type}] detected against REMON or server from ${incident.ip}. Automatically executing UFW/Fail2ban quarantine block.`);
         this.banIpInSystem(incident.ip, `Fallback Defense: Automated Active Block for threat [${type}]`);
       }
+    }
+  }
+
+  reapplyQuarantineBans() {
+    try {
+      const quarantined = db.getQuarantinedIps();
+      if (!quarantined || quarantined.length === 0) {
+        logger.info("[UFW-Sync] No quarantined IPs to reapply.");
+        return;
+      }
+      
+      logger.info(`[UFW-Sync] Re-applying bans for ${quarantined.length} quarantined IPs...`);
+      logManager.addLog("server", "info", `Запуск фоновой синхронизации брандмауэра для ${quarantined.length} IP в карантине.`);
+      
+      const isWin = process.platform === "win32";
+      if (isWin) {
+        logger.info("[UFW-Sync] Windows detected, simulating quarantine re-apply.");
+        return;
+      }
+
+      const { exec } = require("child_process");
+      const sudoPrefix = "sudo ";
+      
+      const validIps = quarantined
+        .map(q => q.ip)
+        .filter(ip => this.whitelistManager.isValidIp(ip) && this.whitelistManager.isIpBannable(ip));
+
+      if (validIps.length === 0) {
+        logger.info("[UFW-Sync] No valid and bannable quarantined IPs found.");
+        return;
+      }
+
+      const ipListStr = validIps.join(" ");
+      const command = `for ip in ${ipListStr}; do ${sudoPrefix}ufw deny from "$ip" to any; ${sudoPrefix}fail2ban-client set sshd banip "$ip" 2>/dev/null || true; done`;
+      
+      exec(command, (err, stdout, stderr) => {
+        if (err) {
+          logger.error(`[UFW-Sync] Failed to reapply quarantine rules: ${err.message}`, { stderr });
+          logManager.addLog("server", "error", `Ошибка при автоматическом перебанивании IP в UFW: ${err.message}`);
+        } else {
+          logger.info(`[UFW-Sync] Successfully reapplied quarantine rules for: ${ipListStr}`);
+          logManager.addLog("server", "info", `Успешно применены правила блокировки UFW/fail2ban для IP: ${ipListStr}`);
+        }
+      });
+    } catch (e) {
+      logger.error(`[UFW-Sync] Unexpected error in reapplyQuarantineBans: ${e.message}`);
     }
   }
 }
@@ -1305,6 +1360,9 @@ function banIpInSystem(ip, reason) {
 function unbanIpInSystem(ip) {
   return activeDefenseEngine.unbanIpInSystem(ip);
 }
+function reapplyQuarantineBans() {
+  return activeDefenseEngine.reapplyQuarantineBans();
+}
 function updateSshAndFileWhitelist() {
   return whitelistManager.updateSshAndFileWhitelist();
 }
@@ -1818,6 +1876,16 @@ app.post("/api/metrics", (req, res) => {
   lastMetricsReceivedTime = Date.now();
   const payload = req.body;
   const { monitor, anomalies = [] } = payload;
+  
+  if (monitor === "sec_tools_monitor" && payload.ufw && payload.ufw.status) {
+    const currentUfwStatus = payload.ufw.status;
+    if (currentUfwStatus === "active" && lastKnownUfwStatus !== "active") {
+      logger.info(`[UFW Monitor Auto-Sync] UFW status transitioned to active. Re-applying all quarantine bans.`);
+      reapplyQuarantineBans();
+    }
+    lastKnownUfwStatus = currentUfwStatus;
+  }
+
   broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) });
   for (const a of anomalies) {
     addIncident(a.severity || "HIGH", a.monitor || monitor || "Monitor", a.type || "anomaly", a.description || a.type, payload);
@@ -2428,6 +2496,8 @@ app.post("/api/activate-security", (req, res) => {
       } else {
         logger.info("Security activation completed successfully");
         addLog("server", "info", "Security activation completed successfully. UFW, Fail2ban, and Lua are configured.");
+        lastKnownUfwStatus = "active";
+        reapplyQuarantineBans();
       }
     });
     res.json({ success: true });
@@ -3018,6 +3088,8 @@ function performStartupHardeningAudit() {
         );
       } else {
         logger.info("[Startup Audit] UFW Firewall is ACTIVE");
+        lastKnownUfwStatus = "active";
+        reapplyQuarantineBans();
       }
     });
 
