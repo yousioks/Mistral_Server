@@ -124,7 +124,8 @@ let soarSettings = {
   aiThreatThreshold: 3,
   aiTriggerOnLeaks: true,
   aiTriggerOnCritical: true,
-  honeypotEnabled: false // default disabled
+  honeypotEnabled: false, // default disabled
+  aiTriggerTypes: []
 };
 
 // Honeypot global state and control helpers
@@ -1492,7 +1493,7 @@ app.post("/api/soar-settings", (req, res) => {
   const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
   if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
 
-  const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical, honeypotEnabled } = req.body || {};
+  const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical, honeypotEnabled, aiTriggerTypes } = req.body || {};
   if (autoBanDdos !== undefined) soarSettings.autoBanDdos = !!autoBanDdos;
   if (autoBanBruteForce !== undefined) soarSettings.autoBanBruteForce = !!autoBanBruteForce;
   if (aiDefenseEnabled !== undefined) soarSettings.aiDefenseEnabled = !!aiDefenseEnabled;
@@ -1501,6 +1502,14 @@ app.post("/api/soar-settings", (req, res) => {
   if (aiThreatThreshold !== undefined) soarSettings.aiThreatThreshold = Number(aiThreatThreshold);
   if (aiTriggerOnLeaks !== undefined) soarSettings.aiTriggerOnLeaks = !!aiTriggerOnLeaks;
   if (aiTriggerOnCritical !== undefined) soarSettings.aiTriggerOnCritical = !!aiTriggerOnCritical;
+  
+  if (aiTriggerTypes !== undefined) {
+    if (Array.isArray(aiTriggerTypes)) {
+      soarSettings.aiTriggerTypes = aiTriggerTypes.map(String);
+    } else {
+      soarSettings.aiTriggerTypes = [];
+    }
+  }
   
   if (honeypotEnabled !== undefined) {
     const nextHoneypot = !!honeypotEnabled;
@@ -2658,6 +2667,21 @@ function broadcast(msg) {
   }
 }
 
+function getActiveConnectionsList() {
+  const list = [];
+  for (const [wsConn, clientData] of clients.entries()) {
+    if (clientData && clientData.authenticated) {
+      list.push({
+        id: clientData.id,
+        ip: clientData.ip,
+        username: clientData.username || "admin",
+        connectedAt: clientData.connectedAt || new Date().toISOString()
+      });
+    }
+  }
+  return list;
+}
+
 function startWSS(server) {
   const wss = new WebSocket.Server({ server, path: "/ws" });
   wss.on("connection", (ws, req) => {
@@ -2676,15 +2700,19 @@ function startWSS(server) {
         const client = clients.get(ws);
 
         if (msg.event === "auth") {
-          const { token, nonce } = msg.data || {};
+          const { token, nonce, username } = msg.data || {};
           if (!token || !nonce) { ws.send(JSON.stringify({ event: "auth_error", data: { error: "Missing token or nonce" } })); return; }
           if (usedNonces.has(nonce)) { ws.close(4002, "Replay detected"); return; }
           if (token === WSS_SECRET_TOKEN) {
             usedNonces.add(nonce);
             client.authenticated = true;
+            client.username = username || "admin";
+            client.connectedAt = new Date().toISOString();
             clearTimeout(authTimer);
-            ws.send(JSON.stringify({ event: "auth_success", data: { clientId, model: activeModel, clientIp: ip } }));
-            addLog("server", "info", "WS client authenticated", { clientId, ip });
+            ws.send(JSON.stringify({ event: "auth_success", data: { clientId, model: activeModel, clientIp: ip, username: client.username, connectedAt: client.connectedAt } }));
+            addLog("server", "info", `WS client authenticated: ${client.username}`, { clientId, ip });
+            ws.send(JSON.stringify({ event: "active_connections", data: getActiveConnectionsList() }));
+            broadcast({ event: "active_connections", data: getActiveConnectionsList() });
             // Сразу шлём снапшот
             ws.send(JSON.stringify({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } }));
             ws.send(JSON.stringify({ event: "incidents_list", data: incidents.slice(0, 100) }));
@@ -2696,6 +2724,15 @@ function startWSS(server) {
               api_key: m.api_key ? "********" : ""
             }));
             ws.send(JSON.stringify({ event: "custom_models_updated", data: customModels }));
+            
+            // Сразу шлём системные метрики (с докер-контейнерами)
+            try {
+              const osModule = require("os");
+              const initialMetrics = enrichMetricsWithWaf({ ...getHostMetrics(osModule.totalmem(), osModule.freemem()), receivedAt: new Date().toISOString() });
+              ws.send(JSON.stringify({ event: "metrics", data: initialMetrics }));
+            } catch (err) {
+              logger.error("Failed to send initial metrics", { err: err.message });
+            }
           } else {
             addLog("server", "warn", "WS auth failed: bad token", { clientId, ip });
             ws.close(4003, "Invalid token");
@@ -2709,6 +2746,16 @@ function startWSS(server) {
         }
 
         if (msg.event === "ping") { ws.send(JSON.stringify({ event: "pong", timestamp: Date.now() })); return; }
+        if (msg.event === "get_metrics") {
+          try {
+            const osModule = require("os");
+            const payload = getHostMetrics(osModule.totalmem(), osModule.freemem());
+            ws.send(JSON.stringify({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) }));
+          } catch (err) {
+            logger.error("Failed to process get_metrics", { err: err.message });
+          }
+          return;
+        }
         if (msg.event === "get_incidents") { ws.send(JSON.stringify({ event: "incidents_list", data: incidents.slice(0, 100) })); return; }
         if (msg.event === "get_logs") {
           const { type = "server", limit = 200 } = msg.data || {};
@@ -2800,7 +2847,7 @@ function startWSS(server) {
             ws.send(JSON.stringify({ event: "ai_result", data: { model: model || activeModel, result, task, isAutoDefense, incidentId } }));
           } catch (err) { 
             clearInterval(progressInterval);
-            ws.send(JSON.stringify({ event: "ai_error", data: { error: err.message } })); 
+            ws.send(JSON.stringify({ event: "ai_error", data: { error: err.message, incidentId } })); 
           }
           return;
         }
@@ -2889,7 +2936,15 @@ function startWSS(server) {
       } catch (err) { logger.error("WS message error", { err: err.message }); }
     });
 
-    ws.on("close", () => { clients.delete(ws); });
+    ws.on("close", () => {
+      const wasAuth = clients.get(ws)?.authenticated;
+      const username = clients.get(ws)?.username;
+      clients.delete(ws);
+      if (wasAuth) {
+        addLog("server", "info", `WS client disconnected: ${username || 'unknown'}`);
+        broadcast({ event: "active_connections", data: getActiveConnectionsList() });
+      }
+    });
     ws.on("error", (err) => { logger.error("WS error", { err: err.message }); });
   });
   return wss;
