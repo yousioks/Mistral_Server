@@ -19,7 +19,17 @@ console.log("[Bot] MISTRAL Telegram Bot запущен. Polling...");
 function apiRequest(method, path, body) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
-    const opts = { hostname: "localhost", port: Number(API_PORT), path, method, headers: { "Content-Type": "application/json" } };
+    const opts = { 
+      hostname: "localhost", 
+      port: Number(API_PORT), 
+      path, 
+      method, 
+      headers: { 
+        "Content-Type": "application/json",
+        "X-Auth-Token": process.env.WSS_SECRET_TOKEN || "",
+        "X-API-Key": process.env.WSS_SECRET_TOKEN || ""
+      } 
+    };
     if (data) opts.headers["Content-Length"] = Buffer.byteLength(data);
     const req = http.request(opts, (res) => {
       let raw = "";
@@ -45,6 +55,21 @@ async function broadcastAlert(incident) {
     return; // Ignore low or medium severity to prevent spamming
   }
 
+  // Filter out DDoS/Flood and SSH Brute Force from Telegram bot notifications
+  const typeUpper = (incident.type || "").toUpperCase();
+  const descUpper = (incident.description || "").toUpperCase();
+  if (
+    typeUpper.includes("DDOS") || 
+    typeUpper.includes("FLOOD") || 
+    typeUpper.includes("SSH_BRUTE") ||
+    descUpper.includes("DDOS") || 
+    descUpper.includes("FLOOD") || 
+    descUpper.includes("SSH_BRUTE") ||
+    descUpper.includes("SSH BRUTE")
+  ) {
+    return;
+  }
+
   const chatIds = db.getAllChatIds();
   if (!chatIds.length) { console.log("[Bot] Нет chat_id в БД"); return; }
   
@@ -66,9 +91,6 @@ async function broadcastAlert(incident) {
   
   if (severity === "CRITICAL" || severity === "HIGH") {
     text += `\n🔴 <b>ВНИМАНИЕ: СИСТЕМА ПОД УГРОЗОЙ!</b>\n`;
-    opts.reply_markup = {
-      inline_keyboard: [[{ text: "🧠 АНАЛИЗ ИИ", callback_data: `ai_${id}` }]]
-    };
   }
 
   for (const chatId of chatIds) await reply(chatId, text, opts);
@@ -247,6 +269,10 @@ bot.on("message", async (msg) => {
 const botApp = express();
 botApp.use(express.json({ limit: "50mb" }));
 botApp.post("/api/bot-notify", async (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== process.env.WSS_SECRET_TOKEN) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
   const incident = req.body;
   if (incident && incident.severity) await broadcastAlert(incident);
   res.json({ ok: true });

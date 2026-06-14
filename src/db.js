@@ -139,13 +139,6 @@ initSchema();
   try { db.exec(`ALTER TABLE incidents ADD COLUMN ${col}`); } catch (_) {}
 });
 
-// Дефолтный admin если таблица пустая
-const adminExists = db.prepare('SELECT count(*) as count FROM users').get();
-if (adminExists.count === 0) {
-  const hash = bcrypt.hashSync('admin', 10);
-  db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)').run('admin', hash, 'admin');
-  console.log('[DB] Default admin created: login=admin password=admin');
-}
 
 // --- Users ---
 function verifyUser(username, password) {

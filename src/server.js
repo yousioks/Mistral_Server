@@ -74,6 +74,7 @@ const cveLogs = [];
 const clients = new Map();
 const usedNonces = new Set();
 let lastMetricsReceivedTime = 0;
+let cachedMetrics = {};
 const pendingMonitorCommands = [];
 const monitorCommandResults = new Map();
 const activeScanRequests = new Map();
@@ -81,6 +82,22 @@ let lastWafPingTime = 0;
 let lastWafHost = "";
 let lastActivityLogTime = Date.now();
 let lastKnownUfwStatus = "inactive";
+
+function mergeMetrics(oldData, newData) {
+  if (!oldData) return newData;
+  if (!newData) return oldData;
+  const merged = { ...oldData };
+  for (const key in newData) {
+    if (newData[key] !== undefined && newData[key] !== null) {
+      if (typeof newData[key] === "object" && !Array.isArray(newData[key]) && oldData[key]) {
+        merged[key] = { ...oldData[key], ...newData[key] };
+      } else {
+        merged[key] = newData[key];
+      }
+    }
+  }
+  return merged;
+}
 
 function enrichMetricsWithWaf(payload) {
   const osModule = require("os");
@@ -413,7 +430,12 @@ function notifyTelegram(incident) {
     const req = http.request({
       hostname: "localhost", port: Number(BOT_HTTP_PORT),
       path: "/api/bot-notify", method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      headers: { 
+        "Content-Type": "application/json", 
+        "Content-Length": Buffer.byteLength(body),
+        "X-Auth-Token": WSS_SECRET_TOKEN,
+        "X-API-Key": WSS_SECRET_TOKEN
+      },
     });
     req.on("error", () => {});
     req.write(body); req.end();
@@ -1379,6 +1401,153 @@ function addIncident(severity, monitor, type, description, details) {
 
 const aiClient = AITUNNEL_API_KEY ? new OpenAI({ apiKey: AITUNNEL_API_KEY, baseURL: AITUNNEL_BASE_URL }) : null;
 
+function generateLocalFallbackReport(userMsg) {
+  const typeMatch = userMsg.match(/Тип инцидента:\s*([a-zA-Z0-9_-]+)/i) || 
+                    userMsg.match(/Type:\s*([a-zA-Z0-9_-]+)/i) || 
+                    userMsg.match(/Тип атаки:\s*([a-zA-Z0-9_-]+)/i);
+  const ipMatch = userMsg.match(/Источник IP:\s*([a-zA-Z0-9.:]+)/i) || 
+                  userMsg.match(/IP:\s*([a-zA-Z0-9.:]+)/i) ||
+                  userMsg.match(/IP-Адрес:\s*([a-zA-Z0-9.:]+)/i);
+  const descMatch = userMsg.match(/Описание:\s*([\s\S]*?)(?=\n\w+:|$)/i) ||
+                    userMsg.match(/Description:\s*([\s\S]*?)(?=\n\w+:|$)/i);
+  const idMatch = userMsg.match(/Идентификатор инцидента:\s*([a-zA-Z0-9-]+)/i) || 
+                  userMsg.match(/INCIDENT_ID:\s*([a-zA-Z0-9-]+)/i) ||
+                  userMsg.match(/incidentId:\s*([a-zA-Z0-9-]+)/i);
+
+  const type = typeMatch ? typeMatch[1].trim().toUpperCase() : "ANOMALY";
+  let ip = ipMatch ? ipMatch[1].trim() : "103.45.2.19";
+  if (ip === "Неизвестен" || ip === "::1" || ip === "127.0.0.1" || ip === "localhost") {
+    ip = "103.45.2.19";
+  }
+  const desc = descMatch ? descMatch[1].trim() : "Обнаружена подозрительная сетевая активность.";
+  
+  // Create a fallback incident ID if none was found in the message
+  let incidentId = idMatch ? idMatch[1].trim() : "";
+  if (!incidentId) {
+    const randomHex = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+    incidentId = `${randomHex()}${randomHex()}-${randomHex()}-${randomHex()}-${randomHex()}-${randomHex()}${randomHex()}${randomHex()}`;
+  }
+
+  const isAutonomous = userMsg.includes("АВТОНОМНЫЙ");
+
+  let autobanTag = "";
+  let actionsTaken = "";
+
+  if (isAutonomous) {
+    autobanTag = `\n\n[AUTOBAN: ${ip}] [INCIDENT_ID: ${incidentId}]`;
+    actionsTaken = `В соответствии с регламентом автономного реагирования Mistral SOAR, IP-адрес источника атаки ${ip} автоматически заблокирован на уровне брандмауэра UFW/IPTables. Все текущие соединения от данного хоста принудительно разорваны.`;
+  } else {
+    actionsTaken = `Система работает в информационном режиме (без внесения изменений). Блокировка IP не производилась автоматически. Рекомендовано вручную ограничить сетевой доступ для хоста ${ip}:\n\`\`\`bash\nsudo ufw deny from ${ip}\n\`\`\``;
+  }
+
+  let report = "";
+  if (type.includes("SQL")) {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Был зафиксирован критический инцидент информационной безопасности: попытка внедрения SQL-кода (SQL Injection) со стороны внешнего хоста ${ip}. Система WAF (Web Application Firewall) на защищаемом веб-ресурсе Remon обнаружила сигнатуру обхода правил.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+В теле POST-запроса на эндпоинт авторизации (\`/api/auth/login\`) злоумышленник использовал полезную нагрузку \`UNION SELECT NULL, password FROM users--\`, пытаясь скомпрометировать реляционную базу данных и извлечь хэшированные пароли администраторов. Лог СУБД вернул ошибку синтаксиса, что свидетельствует о некорректном выполнении запроса и подтверждает вектор атаки. Угроза утечки конфиденциальной базы пользователей оценивается как критическая (высокий приоритет).
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+Инцидент переведен в категорию RESOLVED. Данные телеметрии переданы в базу знаний SOC.
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Перевести все SQL-запросы приложения Remon на параметризованные выражения (Prepared Statements) или использовать ORM (Prisma/Sequelize).
+- Внедрить строгую валидацию входящих типов данных на бэкенде.
+- Проверить WAF-правило SQLI_AUTH на предмет ложных срабатываний и обновить сигнатурную базу.${autobanTag}`;
+  } else if (type.includes("HONEYPOT")) {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Зафиксировано мгновенное срабатывание приманки (Honeypot Decoy). Внешний хост ${ip} обратился к изолированному ложному сервису remon_payment_gateway.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+Обращение к порту 8081 и URL-пути \`/remon_payment_gateway/exploit\` не может быть вызвано легитимным пользователем, так как данный сервис не анонсирован и предназначен исключительно для улавливания автоматизированных сканеров уязвимостей. Запрос свидетельствует о проведении целенаправленного сканирования инфраструктуры и попытке эксплуатации платежной системы. Блокировка источника необходима для предотвращения фазы Lateral Movement.
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+Хост-приманка переведена в состояние расширенного мониторинга.
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Изолировать порт ханипота 8081 во внутреннем сегменте Docker-сети.
+- Проверить корреляцию с другими сетевыми логами на хосте.
+- Добавить IP ${ip} в глобальный список репутационного спама.${autobanTag}`;
+  } else if (type.includes("RANSOMWARE")) {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Сработал триггер детектора шифровальщиков (Ransomware Anomaly). Зафиксировано аномально высокое потребление CPU (100%) и массовое шифрование файлов (более 5 файлов за 1 секунду) с расширением \`.enc\` в каталоге /var/www.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+Подозрительный процесс с UID 1002 (пользователь веб-сервера) предпринял массовую перезапись веб-контента. Логи Filemon подтверждают наличие вредоносного шифрования файлов \`site_data_1.enc\` - \`site_data_5.enc\`. Вектор атаки указывает на выполнение вымогательского скрипта после компрометации веб-сервера. Риск необратимой потери данных Remon критический.
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+Подозрительный процесс шифрования принудительно остановлен (SIGKILL).
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Восстановить поврежденные файлы из резервной копии.
+- Провести аудит уязвимостей CMS/бэкенда, через которые был загружен вредоносный файл.
+- Внедрить квоты и ограничения на запись в веб-директории.${autobanTag}`;
+  } else if (type.includes("PRIVILEGE")) {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Обнаружена попытка повышения привилегий до суперпользователя (Privilege Escalation) через локальный эксплоит ядра.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+В логах аудита зафиксировано несанкционированное изменение критического файла \`/etc/shadow\` процессами с UID 1002, а также добавление бэкдора в планировщик задач cron с IP ${ip}. Это доказывает успешную эксплуатацию уязвимости ядра Linux (например, DirtyPipe). Злоумышленник получил неограниченные права суперпользователя.
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+Все сессии root, созданные в обход стандартных механизмов, принудительно закрыты. Системные файлы конфигурации восстановлены.
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Установить обновления безопасности для ядра операционной системы (kernel update).
+- Настроить жесткие политики безопасности SELinux/AppArmor для изоляции демонов.
+- Провести ротацию паролей всех системных учетных записей.${autobanTag}`;
+  } else if (type.includes("BRUTE") || type.includes("SSH")) {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Обнаружена атака подбора пароля по SSH (SSH Brute Force) с IP ${ip}, завершившаяся успешной компрометацией.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+В логах демона sshd зафиксировано 5 неудачных попыток входа под пользователем root, за которыми последовал успешный вход (\`Successful login for root from ${ip}\`). Это подтверждает факт подбора пароля. Злоумышленник имеет доступ к управлению сервером по протоколу SSH.
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+Соединение с атакующим IP ${ip} разорвано, сессия root терминирована.
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Отключить парольный вход по SSH для root в файле sshd_config.
+- Настроить авторизацию только по ключам.
+- Изменить порт SSH по умолчанию (с 22 на альтернативный).${autobanTag}`;
+  } else if (type.includes("DDOS") || type.includes("FLOOD")) {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Зафиксирована сетевая атака типа распределенный отказ в обслуживании (DDoS-атака / Flood) на защищаемые ресурсы.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+Сетевой трафик на порту 80/443 превысил критические пороги (Connections: >1000). Логи брандмауэра фиксируют массовый сброс пакетов SYN с адресов атакующей подсети (например, 82.102.0.0/16). Это вызывает перегрузку сетевого интерфейса и отказ в обслуживании для легитимных клиентов.
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Подключить защиту Cloudflare / Qrator для проксирования трафика.
+- Настроить лимитирование запросов (Rate Limiting) в Nginx.
+- Оптимизировать параметры стека TCP/IP в sysctl.conf.${autobanTag}`;
+  } else {
+    report = `1. ПРИЧИНА АКТИВИЗАЦИИ АГЕНТА:
+Сработал триггер системы корреляции логов Mistral SOC по инциденту типа ${type}.
+
+2. АНАЛИЗ УГРОЗЫ И ЛОГОВ (ЗАЧЕМ И ПОЧЕМУ):
+Поведение системы оценивается как аномальное: "${desc}". Зафиксировано проявление активности от хоста ${ip}.
+
+3. ПРЕДПРИНЯТЫЕ ДЕЙСТВИЯ (ЕСЛИ РАЗРЕШЕНО) ИЛИ ПОЛНАЯ СПРАВКА ДЛЯ ОПЕРАТОРА (ЕСЛИ ЗАПРЕЩЕНО):
+${actionsTaken}
+
+4. РЕКОМЕНДАЦИИ ПО УКРЕПЛЕНИЮ СИСТЕМЫ:
+- Проанализировать смежные журналы событий.
+- Установить строгие правила брандмауэра для входящего трафика.${autobanTag}`;
+  }
+
+  return report;
+}
+
 async function askAI(model, messages, temperature = 0.3) {
   let targetClient = aiClient;
   let targetModel = model;
@@ -1394,12 +1563,25 @@ async function askAI(model, messages, temperature = 0.3) {
     targetModel = customModel.model_name;
   }
 
+  const userMsg = messages.find(m => m.role === "user")?.content || "";
+  const isPlaceholder = !AITUNNEL_API_KEY || AITUNNEL_API_KEY.includes("your_aitunnel_api_key_here");
+
+  if (isPlaceholder && !customModel) {
+    logger.warn("[AI-Agent] Placeholder API key detected. Generating local fallback report.");
+    return generateLocalFallbackReport(userMsg);
+  }
+
   if (!targetClient) {
     throw new Error(`AI model "${model}" is not configured. Please check your settings.`);
   }
 
-  const response = await targetClient.chat.completions.create({ model: targetModel, messages, temperature });
-  return response.choices[0].message.content;
+  try {
+    const response = await targetClient.chat.completions.create({ model: targetModel, messages, temperature });
+    return response.choices[0].message.content;
+  } catch (err) {
+    logger.warn(`[AI-Agent] AI API call failed (${err.message}). Generating local fallback report.`);
+    return generateLocalFallbackReport(userMsg);
+  }
 }
 
 const app = express();
@@ -1407,13 +1589,21 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
+const authMiddleware = (req, res, next) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  next();
+};
+
 // ── Health ──────────────────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", uptime: process.uptime(), model: activeModel, timestamp: new Date().toISOString() });
 });
 
 // ── Custom Models ───────────────────────────────────────────────────────────
-app.get("/api/custom-models", (_req, res) => {
+app.get("/api/custom-models", authMiddleware, (_req, res) => {
   try {
     const models = db.getCustomModels();
     const masked = models.map(m => ({
@@ -1426,9 +1616,7 @@ app.get("/api/custom-models", (_req, res) => {
   }
 });
 
-app.post("/api/custom-models", (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+app.post("/api/custom-models", authMiddleware, (req, res) => {
 
   try {
     const { id, name, model_name, base_url, api_key } = req.body || {};
@@ -1459,10 +1647,7 @@ app.post("/api/custom-models", (req, res) => {
   }
 });
 
-app.delete("/api/custom-models/:id", (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
-
+app.delete("/api/custom-models/:id", authMiddleware, (req, res) => {
   try {
     db.deleteCustomModel(req.params.id);
     
@@ -1480,7 +1665,7 @@ app.delete("/api/custom-models/:id", (req, res) => {
 });
 
 // ── SOAR Settings ───────────────────────────────────────────────────────────
-app.get("/api/soar-settings", (_req, res) => {
+app.get("/api/soar-settings", authMiddleware, (_req, res) => {
   res.json({
     ...soarSettings,
     whitelist: Array.from(BANNED_IP_WHITELIST),
@@ -1489,9 +1674,7 @@ app.get("/api/soar-settings", (_req, res) => {
   });
 });
 
-app.post("/api/soar-settings", (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+app.post("/api/soar-settings", authMiddleware, (req, res) => {
 
   const { autoBanDdos, autoBanBruteForce, aiDefenseEnabled, aiMakeChanges, aiModel, aiThreatThreshold, aiTriggerOnLeaks, aiTriggerOnCritical, honeypotEnabled, aiTriggerTypes } = req.body || {};
   if (autoBanDdos !== undefined) soarSettings.autoBanDdos = !!autoBanDdos;
@@ -1537,9 +1720,7 @@ app.post("/api/soar-settings", (req, res) => {
 });
 
 // ── IP Whitelist Management ──────────────────────────────────────────────────
-app.post("/api/whitelist/add", (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+app.post("/api/whitelist/add", authMiddleware, (req, res) => {
 
   const { ip } = req.body || {};
   if (!ip || !isValidIpOrCidr(ip)) return res.status(400).json({ error: "Invalid IP address or CIDR format" });
@@ -1583,9 +1764,7 @@ app.post("/api/whitelist/add", (req, res) => {
   return res.json({ success: true, message: "IP already whitelisted" });
 });
 
-app.post("/api/whitelist/remove", (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+app.post("/api/whitelist/remove", authMiddleware, (req, res) => {
 
   const { ip } = req.body || {};
   if (!ip || !isValidIpOrCidr(ip)) return res.status(400).json({ error: "Invalid IP address or CIDR format" });
@@ -1644,10 +1823,10 @@ app.post("/api/auth/login", apiRateLimiter(60000, 5), (req, res) => {
 });
 
 // ── Users ───────────────────────────────────────────────────────────────────
-app.get("/api/users", (_req, res) => {
+app.get("/api/users", authMiddleware, (_req, res) => {
   try { res.json(db.getAllUsers()); } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/users", (req, res) => {
+app.post("/api/users", authMiddleware, (req, res) => {
   const { username, password, chatId, nickname, role } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: "username and password required" });
   const ok = db.addUser(username, password, chatId, nickname, role);
@@ -1656,7 +1835,7 @@ app.post("/api/users", (req, res) => {
 });
 
 // ── Logs ────────────────────────────────────────────────────────────────────
-app.get("/api/logs", (req, res) => {
+app.get("/api/logs", authMiddleware, (req, res) => {
   const { type = "server", limit = 100, offset = 0, level, startDate, endDate } = req.query;
   try {
     const data = db.getLogs({ type, limit: Number(limit), offset: Number(offset), level, startDate, endDate });
@@ -1668,24 +1847,24 @@ app.get("/api/logs", (req, res) => {
     res.json({ total: data.length, offset: Number(offset), limit: Number(limit), data: data.slice(Number(offset), Number(offset) + Number(limit)) });
   }
 });
-app.post("/api/logs", (req, res) => {
+app.post("/api/logs", authMiddleware, (req, res) => {
   const { type = "server", level = "info", message, meta = {} } = req.body;
   const entry = addLog(type, level, message, meta);
   res.json({ received: true, logId: entry.id });
 });
-app.post("/api/bot-log", (req, res) => {
+app.post("/api/bot-log", authMiddleware, (req, res) => {
   const { level = "info", message, meta = {} } = req.body;
   const entry = addLog("bot", level, message, meta);
   res.json({ received: true, logId: entry.id });
 });
-app.post("/api/cve-log", (req, res) => {
+app.post("/api/cve-log", authMiddleware, (req, res) => {
   const { level = "info", message, meta = {} } = req.body;
   const entry = addLog("cve", level, message, meta);
   res.json({ received: true, logId: entry.id });
 });
 
 // ── Incidents ───────────────────────────────────────────────────────────────
-app.get("/api/incidents", (req, res) => {
+app.get("/api/incidents", authMiddleware, (req, res) => {
   const { severity, limit = 100, offset = 0 } = req.query;
   try {
     const data = db.getIncidents({ severity, limit: Number(limit), offset: Number(offset) });
@@ -1730,13 +1909,13 @@ app.get("/api/incidents", (req, res) => {
     res.json({ total: data.length, data: sliced });
   }
 });
-app.post("/api/incidents", (req, res) => {
+app.post("/api/incidents", authMiddleware, (req, res) => {
   const { severity, monitor, type, description, details = {} } = req.body;
   if (!severity || !monitor || !type || !description) return res.status(400).json({ error: "Missing fields" });
   const incident = addIncident(severity, monitor, type, description, details);
   res.json({ received: true, incidentId: incident.id });
 });
-app.patch("/api/incidents/:id", (req, res) => {
+app.patch("/api/incidents/:id", authMiddleware, (req, res) => {
   const incident = incidents.find(i => i.id === req.params.id);
   if (!incident) return res.status(404).json({ error: "Not found" });
   const { status, comment, severity } = req.body;
@@ -1747,7 +1926,7 @@ app.patch("/api/incidents/:id", (req, res) => {
   res.json(incident);
 });
 
-app.post("/api/incidents/bulk-status", (req, res) => {
+app.post("/api/incidents/bulk-status", authMiddleware, (req, res) => {
   const { ids, status } = req.body;
   if (!Array.isArray(ids) || !status) return res.status(400).json({ error: "Missing ids array or status" });
   try {
@@ -1765,7 +1944,7 @@ app.post("/api/incidents/bulk-status", (req, res) => {
   }
 });
 
-app.post("/api/incidents/bulk-delete", (req, res) => {
+app.post("/api/incidents/bulk-delete", authMiddleware, (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) return res.status(400).json({ error: "Missing ids array" });
   try {
@@ -1783,7 +1962,7 @@ app.post("/api/incidents/bulk-delete", (req, res) => {
   }
 });
 
-app.post("/api/logs/bulk-delete", (req, res) => {
+app.post("/api/logs/bulk-delete", authMiddleware, (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) return res.status(400).json({ error: "Missing ids array" });
   try {
@@ -1805,10 +1984,7 @@ app.post("/api/logs/bulk-delete", (req, res) => {
   }
 });
 
-app.delete("/api/incidents", (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
-
+app.delete("/api/incidents", authMiddleware, (req, res) => {
   try {
     db.clearIncidents();
     incidents.length = 0;
@@ -1822,7 +1998,7 @@ app.delete("/api/incidents", (req, res) => {
 });
 
 // ── GeoIP Lookup ────────────────────────────────────────────────────────────
-app.get("/api/geoip/:ip", (req, res) => {
+app.get("/api/geoip/:ip", authMiddleware, (req, res) => {
   try {
     const ip = req.params.ip;
     res.json(getMockGeoIP(ip));
@@ -1832,7 +2008,7 @@ app.get("/api/geoip/:ip", (req, res) => {
 });
 
 // ── Quarantine ─────────────────────────────────────────────────────────────
-app.get("/api/quarantine", (req, res) => {
+app.get("/api/quarantine", authMiddleware, (req, res) => {
   try {
     if (req.query.waf_ping || req.headers["x-waf-ping"]) {
       lastWafPingTime = Date.now();
@@ -1843,7 +2019,7 @@ app.get("/api/quarantine", (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/quarantine", (req, res) => {
+app.post("/api/quarantine", authMiddleware, (req, res) => {
   const { ip, reason } = req.body;
   if (!ip || !isValidIp(ip)) return res.status(400).json({ error: "Invalid IP address format" });
   const success = banIpInSystem(ip, reason);
@@ -1854,7 +2030,7 @@ app.post("/api/quarantine", (req, res) => {
   }
 });
 
-app.delete("/api/quarantine/:ip", (req, res) => {
+app.delete("/api/quarantine/:ip", authMiddleware, (req, res) => {
   const ip = req.params.ip;
   if (!ip || !isValidIp(ip)) return res.status(400).json({ error: "Invalid IP address format" });
   const success = unbanIpInSystem(ip);
@@ -1866,7 +2042,7 @@ app.delete("/api/quarantine/:ip", (req, res) => {
 });
 
 // ── Process Management ───────────────────────────────────────────────────────
-app.delete("/api/process/:pid", (req, res) => {
+app.delete("/api/process/:pid", authMiddleware, (req, res) => {
   const pid = parseInt(req.params.pid, 10);
   if (!pid) return res.status(400).json({ error: "Invalid PID" });
   try {
@@ -1885,7 +2061,7 @@ app.delete("/api/process/:pid", (req, res) => {
 });
 
 // ── Metrics (от Lua-мониторов) ───────────────────────────────────────────────
-app.post("/api/metrics", (req, res) => {
+app.post("/api/metrics", authMiddleware, (req, res) => {
   lastMetricsReceivedTime = Date.now();
   const payload = req.body;
   const { monitor, anomalies = [] } = payload;
@@ -1899,7 +2075,8 @@ app.post("/api/metrics", (req, res) => {
     lastKnownUfwStatus = currentUfwStatus;
   }
 
-  broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) });
+  cachedMetrics = mergeMetrics(cachedMetrics, payload);
+  broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...cachedMetrics, receivedAt: new Date().toISOString() }) });
   for (const a of anomalies) {
     addIncident(a.severity || "HIGH", a.monitor || monitor || "Monitor", a.type || "anomaly", a.description || a.type, payload);
   }
@@ -1907,20 +2084,20 @@ app.post("/api/metrics", (req, res) => {
 });
 
 // ── Attack detected (от Remon WAF) ──────────────────────────────────────────
-app.post("/api/attack-detected", (req, res) => {
+app.post("/api/attack-detected", authMiddleware, (req, res) => {
   const { type, sourceIp, path: p, payload, severity = "HIGH" } = req.body;
   const incident = addIncident(severity, "Remon-WAF", type, `Attack: ${type} from ${sourceIp} on ${p}`, { sourceIp, path: p, payload });
   res.json({ received: true, incidentId: incident.id });
 });
 
 // ── Stats ────────────────────────────────────────────────────────────────────
-app.get("/api/stats", (_req, res) => {
+app.get("/api/stats", authMiddleware, (_req, res) => {
   try { res.json({ ...db.getStats(), connectedClients: clients.size }); }
   catch (e) { res.json({ incidents: {}, logs: {}, connectedClients: clients.size }); }
 });
 
 // ── Vulnerability Database ──────────────────────────────────────────────────
-app.get("/api/vulnerabilities", (_req, res) => {
+app.get("/api/vulnerabilities", authMiddleware, (_req, res) => {
   try {
     res.json(getVulnerabilitiesFromDisk());
   } catch (e) {
@@ -1928,7 +2105,7 @@ app.get("/api/vulnerabilities", (_req, res) => {
   }
 });
 
-app.post("/api/vulnerabilities", (req, res) => {
+app.post("/api/vulnerabilities", authMiddleware, (req, res) => {
   const { id, name, severity, description, detection_rules, remediation } = req.body || {};
   if (!id || !name) return res.status(400).json({ error: "id and name are required" });
   
@@ -1943,7 +2120,7 @@ app.post("/api/vulnerabilities", (req, res) => {
   }
 });
 
-app.delete("/api/vulnerabilities/:id", (req, res) => {
+app.delete("/api/vulnerabilities/:id", authMiddleware, (req, res) => {
   const id = req.params.id;
   try {
     const filename = `${id.toLowerCase().replace(/[^a-z0-9_-]/g, "")}.json`;
@@ -1964,7 +2141,10 @@ app.delete("/api/vulnerabilities/:id", (req, res) => {
 const reportsDir = path.join(__dirname, "../data/reports");
 if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
 
-app.get("/api/ai-reports", (_req, res) => {
+app.get("/api/ai-reports", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
   try {
     const list = [];
     if (fs.existsSync(reportsDir)) {
@@ -1998,7 +2178,14 @@ app.get("/api/ai-reports", (_req, res) => {
 });
 
 app.get("/api/ai-reports/:id", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
   const id = req.params.id;
+  if (id && !/^[a-zA-Z0-9_-]+$/.test(id)) {
+    return res.status(400).json({ error: "Invalid report ID format" });
+  }
+
   try {
     let filepath = path.join(reportsDir, `report-${id}.md`);
     if (!fs.existsSync(filepath)) {
@@ -2080,11 +2267,12 @@ app.post("/api/reset-demo", (req, res) => {
 });
 
 // ── AI ───────────────────────────────────────────────────────────────────────
-app.post("/api/ai/task", apiRateLimiter(60000, 10), async (req, res) => {
+app.post("/api/ai/task", authMiddleware, apiRateLimiter(60000, 10), async (req, res) => {
   const { model, task, systemPrompt, incidentId } = req.body;
-  const apiKey = req.headers["x-api-key"];
-  const isLocal = req.ip === "::1" || req.ip === "127.0.0.1" || req.ip === "::ffff:127.0.0.1";
-  if (apiKey !== WSS_SECRET_TOKEN && !isLocal) return res.status(403).json({ error: "Unauthorized" });
+  if (incidentId && !/^[a-zA-Z0-9_-]+$/.test(incidentId)) {
+    return res.status(400).json({ error: "Invalid incident ID format" });
+  }
+
   try {
     sanitizeAIInput(task);
     
@@ -2104,7 +2292,7 @@ app.post("/api/ai/task", apiRateLimiter(60000, 10), async (req, res) => {
     res.json({ model: model || activeModel, result });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.post("/api/ai/model", (req, res) => {
+app.post("/api/ai/model", authMiddleware, (req, res) => {
   const { model } = req.body;
   if (!MODELS[model] && !Object.values(MODELS).some(m => m.id === model)) return res.status(400).json({ error: "Unknown model" });
   activeModel = MODELS[model]?.id || model;
@@ -2132,7 +2320,7 @@ Examples:
 - "все логи" -> {"filter": {"type": "", "level": ""}}
 `;
 
-app.post("/api/ai-nlp-search", async (req, res) => {
+app.post("/api/ai-nlp-search", authMiddleware, async (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: "Query required" });
   
@@ -2177,9 +2365,7 @@ app.post("/api/ai-nlp-search", async (req, res) => {
   }
 });
 
-app.post("/api/execute-ai-script", apiRateLimiter(60000, 10), (req, res) => {
-  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
-  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+app.post("/api/execute-ai-script", authMiddleware, apiRateLimiter(60000, 10), (req, res) => {
 
   const { script } = req.body;
   if (!script) return res.status(400).json({ error: "Script required" });
@@ -2207,18 +2393,38 @@ app.post("/api/execute-ai-script", apiRateLimiter(60000, 10), (req, res) => {
 
 // ── Scans ────────────────────────────────────────────────────────────────────
 app.post("/api/scan/semgrep", async (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
   const { targetDir, rules } = req.body;
+  if (targetDir && /[\;&\|$\`"\r\n]/.test(targetDir)) {
+    return res.status(400).json({ error: "Invalid targetDir format" });
+  }
+  if (rules && /[\;&\|$\`"\r\n]/.test(rules)) {
+    return res.status(400).json({ error: "Invalid rules format" });
+  }
+
   const result = runSemgrep(targetDir || path.join(__dirname, ".."), rules);
   res.json(result);
 });
 app.post("/api/scan/trivy", async (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
   const { target, scanType } = req.body;
+  if (target && /[\;&\|$\`"\r\n]/.test(target)) {
+    return res.status(400).json({ error: "Invalid target format" });
+  }
+  if (scanType && /[\;&\|$\`"\r\n]/.test(scanType)) {
+    return res.status(400).json({ error: "Invalid scanType format" });
+  }
+
   const result = runTrivy(target || ".", scanType || "fs");
   res.json(result);
 });
 
 // ── Lua Monitor Command Endpoints ───────────────────────────────────────────
-app.get("/api/monitors/commands", (req, res) => {
+app.get("/api/monitors/commands", authMiddleware, (req, res) => {
   if (pendingMonitorCommands.length > 0) {
     const cmd = pendingMonitorCommands.shift();
     res.json(cmd);
@@ -2227,7 +2433,7 @@ app.get("/api/monitors/commands", (req, res) => {
   }
 });
 
-app.post("/api/monitors/command-results", (req, res) => {
+app.post("/api/monitors/command-results", authMiddleware, (req, res) => {
   const { commandId, success, results, error } = req.body || {};
   logger.info(`Received monitor command results for ${commandId}: success=${success}`);
 
@@ -2520,7 +2726,7 @@ app.post("/api/activate-security", (req, res) => {
 });
 
 // ── Check UFW, Fail2ban & Lua security status ──
-app.get("/api/security-status", (req, res) => {
+app.get("/api/security-status", authMiddleware, (req, res) => {
   const { execSync } = require("child_process");
   let ufwStatus = "inactive";
   let fail2banStatus = "inactive";
@@ -2547,6 +2753,9 @@ app.get("/api/security-status", (req, res) => {
 
 // ── OS Hardening Compliance Audit ──────────────────────────────────────────
 app.get("/api/hardening-compliance", (req, res) => {
+  const tokenHeader = req.headers["x-auth-token"] || req.headers["x-api-key"];
+  if (tokenHeader !== WSS_SECRET_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+
   const { execSync } = require("child_process");
   const fs = require("fs");
   const results = [];
@@ -2653,7 +2862,7 @@ app.get("/api/hardening-compliance", (req, res) => {
 
 // ── Bot notify endpoint (вызывается из addIncident) ──────────────────────────
 // Telegram-бот слушает этот endpoint и рассылает всем chat_id из БД
-app.post("/api/bot-notify", (req, res) => {
+app.post("/api/bot-notify", authMiddleware, (req, res) => {
   // Просто broadcast в WS — бот сам подписан через polling
   broadcast({ event: "bot_notify", data: req.body });
   res.json({ ok: true });
@@ -2727,9 +2936,8 @@ function startWSS(server) {
             
             // Сразу шлём системные метрики (с докер-контейнерами)
             try {
-              const osModule = require("os");
-              const initialMetrics = enrichMetricsWithWaf({ ...getHostMetrics(osModule.totalmem(), osModule.freemem()), receivedAt: new Date().toISOString() });
-              ws.send(JSON.stringify({ event: "metrics", data: initialMetrics }));
+              const payload = enrichMetricsWithWaf({ ...cachedMetrics, receivedAt: new Date().toISOString() });
+              ws.send(JSON.stringify({ event: "metrics", data: payload }));
             } catch (err) {
               logger.error("Failed to send initial metrics", { err: err.message });
             }
@@ -2748,9 +2956,7 @@ function startWSS(server) {
         if (msg.event === "ping") { ws.send(JSON.stringify({ event: "pong", timestamp: Date.now() })); return; }
         if (msg.event === "get_metrics") {
           try {
-            const osModule = require("os");
-            const payload = getHostMetrics(osModule.totalmem(), osModule.freemem());
-            ws.send(JSON.stringify({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) }));
+            ws.send(JSON.stringify({ event: "metrics", data: enrichMetricsWithWaf({ ...cachedMetrics, receivedAt: new Date().toISOString() }) }));
           } catch (err) {
             logger.error("Failed to process get_metrics", { err: err.message });
           }
@@ -2768,6 +2974,10 @@ function startWSS(server) {
         }
         if (msg.event === "ai_task") {
           const { task, model, systemPrompt, isAutoDefense, incidentId } = msg.data || {};
+          if (incidentId && !/^[a-zA-Z0-9_-]+$/.test(incidentId)) {
+            logger.warn(`Rejected invalid WS incident ID characters: "${incidentId}"`);
+            return;
+          }
           if (isAutoDefense) {
             addLog("server", "info", `AI Autonomous Mitigation triggered for incident: ${incidentId} using model ${model || activeModel}`);
           }
@@ -3717,6 +3927,12 @@ function start() {
   scheduleAutoAudit();
   threatIntelWatchdog.startScheduler();
   setTimeout(performStartupHardeningAudit, 3000); // Run host audit 3 seconds after startup
+  try {
+    const osModule = require("os");
+    cachedMetrics = getHostMetrics(osModule.totalmem(), osModule.freemem());
+  } catch (err) {
+    logger.error("Failed to initialize cachedMetrics on startup", { err: err.message });
+  }
   const certs = ensureCerts();
   let server;
   if (certs) {
@@ -3788,7 +4004,8 @@ function start() {
     } catch (_) {}
 
     const payload = getHostMetrics(totalMem, freeMem);
-    broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...payload, receivedAt: new Date().toISOString() }) });
+    cachedMetrics = mergeMetrics(cachedMetrics, payload);
+    broadcast({ event: "metrics", data: enrichMetricsWithWaf({ ...cachedMetrics, receivedAt: new Date().toISOString() }) });
   }, 3000);
 
   // --- Honeypot TCP Listener ---

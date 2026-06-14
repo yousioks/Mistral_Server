@@ -1,10 +1,14 @@
 const { spawn } = require('child_process');
 const http = require('http');
+const path = require('path');
+
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const API_PORT = process.env.API_PORT || 8080;
 
 function sendLog(level, message, meta = {}) {
   const body = JSON.stringify({ type: 'server', level, message, meta });
+  const token = process.env.WSS_SECRET_TOKEN || '';
   const req = http.request({
     hostname: 'localhost',
     port: API_PORT,
@@ -12,7 +16,9 @@ function sendLog(level, message, meta = {}) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
+      'Content-Length': Buffer.byteLength(body),
+      'X-Auth-Token': token,
+      'X-API-Key': token
     }
   });
   req.on('error', () => {}); // Ignore connection refused when server is restarting
