@@ -6,8 +6,8 @@ require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const API_PORT = process.env.API_PORT || 8080;
 
-function sendLog(level, message, meta = {}) {
-  const body = JSON.stringify({ type: 'server', level, message, meta });
+function sendLog(type, level, message, meta = {}) {
+  const body = JSON.stringify({ type, level, message, meta });
   const token = process.env.WSS_SECRET_TOKEN || '';
   const req = http.request({
     hostname: 'localhost',
@@ -94,12 +94,18 @@ function tailCommand(cmd, args, source) {
     for (const line of lines) {
       if (line.trim()) {
         let msg = line.trim();
+        let logType = 'server';
         if (source === 'docker-events') {
           msg = parseDockerEvent(msg);
+          logType = 'docker';
+        } else if (source === 'syslog') {
+          msg = `[${source}] ${msg}`;
+          logType = 'syslog';
         } else {
           msg = `[${source}] ${msg}`;
+          logType = source;
         }
-        sendLog('info', msg);
+        sendLog(logType, 'info', msg);
       }
     }
   });
@@ -107,7 +113,8 @@ function tailCommand(cmd, args, source) {
     const lines = data.toString().split('\n');
     for (const line of lines) {
       if (line.trim()) {
-        sendLog('warn', `[${source}] ${line.trim()}`);
+        const logType = source === 'docker-events' ? 'docker' : (source === 'syslog' ? 'syslog' : source);
+        sendLog(logType, 'warn', `[${source}] ${line.trim()}`);
       }
     }
   });

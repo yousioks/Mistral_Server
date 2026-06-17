@@ -2963,11 +2963,29 @@ function startWSS(server) {
           return;
         }
         if (msg.event === "get_incidents") { ws.send(JSON.stringify({ event: "incidents_list", data: incidents.slice(0, 100) })); return; }
+        if (msg.event === "get_log_types") {
+          try {
+            const types = db.getLogTypes();
+            const defaults = ['server', 'bot', 'cve', 'docker', 'syslog'];
+            const allTypes = Array.from(new Set([...defaults, ...types]));
+            ws.send(JSON.stringify({ event: "log_types_list", data: allTypes }));
+          } catch (err) {
+            logger.error("Failed to get log types", { err: err.message });
+            ws.send(JSON.stringify({ event: "log_types_list", data: ['server', 'bot', 'cve', 'docker', 'syslog'] }));
+          }
+          return;
+        }
         if (msg.event === "get_logs") {
           const { type = "server", limit = 200 } = msg.data || {};
-          const data = type === "bot" ? botLogs : type === "cve" ? cveLogs : serverLogs;
-          const sliced = data.slice(-limit).reverse();
-          ws.send(JSON.stringify({ event: "logs_list", data: sliced })); return;
+          let logsData;
+          try {
+            logsData = db.getLogs({ type, limit: Number(limit) });
+          } catch (err) {
+            logger.error("Failed to query logs from DB, falling back to memory cache", { err: err.message });
+            const memData = type === "bot" ? botLogs : type === "cve" ? cveLogs : serverLogs;
+            logsData = memData.slice(-limit).reverse();
+          }
+          ws.send(JSON.stringify({ event: "logs_list", data: logsData })); return;
         }
         if (msg.event === "get_stats") {
           ws.send(JSON.stringify({ event: "stats", data: { ...db.getStats(), connectedClients: clients.size } })); return;
