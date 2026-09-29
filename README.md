@@ -9,6 +9,7 @@
 ![Telegram](https://img.shields.io/badge/Telegram-Bot%20API-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
 ![AI SOAR](https://img.shields.io/badge/AI_Engine-DeepSeek%20%7C%20Claude-8A2BE2?style=for-the-badge)
 ![Security](https://img.shields.io/badge/Defense-Zero--Knowledge%20HIDS-red?style=for-the-badge)
+[![Security Pipeline](https://img.shields.io/github/actions/workflow/status/yousioks/Mistral_Server/security.yml?label=DevSecOps%20Pipeline&logo=githubactions&logoColor=white&style=for-the-badge)](https://github.com/yousioks/Mistral_Server/actions/workflows/security.yml)
 
 **Центральное серверное ядро распределенного комплекса мониторинга, анализа и автоматического реагирования на инциденты информационной безопасности (SIEM / SOAR / XDR).**
 
